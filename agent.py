@@ -95,6 +95,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import textwrap
 import time
 import traceback
@@ -115,7 +116,9 @@ from typing import Any
 DEFAULT_MODEL_CHAIN = "qwen/qwen3-coder-next,z-ai/glm-4.6"
 MODEL_CHAIN = [
     name.strip()
-    for name in (os.getenv("RIDGES_MODEL") or os.getenv("RIDGES_MODELS") or DEFAULT_MODEL_CHAIN).split(",")
+    for name in (
+        os.getenv("RIDGES_MODEL", "") or os.getenv("RIDGES_MODELS", "") or DEFAULT_MODEL_CHAIN
+    ).split(",")
     if name.strip()
 ]
 DEFAULT_MODEL = MODEL_CHAIN[0]
@@ -190,7 +193,7 @@ WRAPUP_BUDGET_THRESHOLD = float(os.getenv("RIDGES_WRAPUP_THRESHOLD", "0.55") or 
 # patch to hand back, holding a reserve for the final checks and diff capture.
 # RIDGES_MAX_COST_USD is read because the host sets it; the fallback applies
 # when nothing does.
-MAX_COST_USD = float(os.getenv("RIDGES_MAX_COST_USD") or os.getenv("MAX_COST_USD") or "1.00")
+MAX_COST_USD = float(os.getenv("RIDGES_MAX_COST_USD", "") or os.getenv("MAX_COST_USD", "") or "1.00")
 COST_RESERVE_FRACTION = float(os.getenv("RIDGES_COST_RESERVE", "0.12"))
 # Aim to finish well inside whatever the limit is rather than spending up to it.
 # A task that names its file and its method has no repo-wide search to pay for; a
@@ -211,7 +214,7 @@ _SPENT_USD = 0.0
 # set, so it is fact rather than a guess; the fallback applies when nothing
 # states one. Overrunning is unforgiving: a killed run has nothing to hand back,
 # no matter how good the patch was.
-_AGENT_TIMEOUT = float(os.getenv("AGENT_TIMEOUT") or "900")
+_AGENT_TIMEOUT = float(os.getenv("AGENT_TIMEOUT", "") or "900")
 # Reserve exactly what the endgame needs (a last round of the named checks plus
 # diff capture) plus a small guard against container start-up skew.
 TIME_RESERVE_SEC = int(os.getenv("RIDGES_TIME_RESERVE", "90"))
@@ -334,11 +337,11 @@ def _base_urls() -> list[str]:
     proxy rather than betting the run on either one.
     """
     urls: list[str] = []
-    configured = os.getenv("RIDGES_INFERENCE_BASE_URL") or os.getenv("RIDGES_OPENROUTER_BASE_URL")
+    configured = os.getenv("RIDGES_INFERENCE_BASE_URL", "") or os.getenv("RIDGES_OPENROUTER_BASE_URL", "")
     if configured:
         urls.append(configured.rstrip("/"))
     urls.append("https://openrouter.ai/api/v1")
-    proxy = (os.getenv("SANDBOX_PROXY_URL") or "").strip().rstrip("/")
+    proxy = os.getenv("SANDBOX_PROXY_URL", "").strip().rstrip("/")
     if proxy:
         urls.append(proxy if proxy.endswith("/api/v1") else f"{proxy}/api/v1")
     deduped: list[str] = []
@@ -358,9 +361,9 @@ def _make_client(rotate: bool = False):
     from openai import OpenAI
 
     api_key = (
-        os.getenv("OPENROUTER_API_KEY")
-        or os.getenv("RIDGES_INFERENCE_API_KEY")
-        or os.getenv("RIDGES_OPENROUTER_API_KEY")
+        os.getenv("OPENROUTER_API_KEY", "")
+        or os.getenv("RIDGES_INFERENCE_API_KEY", "")
+        or os.getenv("RIDGES_OPENROUTER_API_KEY", "")
     )
     if not api_key:
         raise RuntimeError(
@@ -449,19 +452,33 @@ def _truncate(text: str, limit: int = MAX_OBSERVATION_CHARS) -> str:
     return f"{head}\n... [truncated {len(text) - limit} chars] ...\n{tail}"
 
 
-def _run(command: str, timeout: int = CMD_TIMEOUT_SEC, cwd: str | None = None) -> str:
-    try:
-        proc = subprocess.run(
-            command, shell=True, capture_output=True, text=True, timeout=timeout, cwd=cwd
-        )
-    except subprocess.TimeoutExpired:
-        return f"[command timed out after {timeout}s]"
-    except Exception as exc:  # noqa: BLE001
-        return f"[command error: {exc}]"
-    out = (proc.stdout or "") + (proc.stderr or "")
-    if proc.returncode != 0:
-        out = f"[exit {proc.returncode}]\n{out}"
+def _run_shell(command: str, timeout: int = CMD_TIMEOUT_SEC, cwd: str | None = None) -> str:
+    """Run one shell command line. The ONLY place a shell is used.
+
+    The `bash` tool exists so the agent can use the project's own tooling, and
+    that means pipes, redirection and `&&`, which need a shell. Two things keep
+    that honest: the interpreter is named explicitly as an argv element rather
+    than handed to the shell=True convenience flag, so the command can never be
+    spliced into a larger command line the caller did not intend; and
+    `_bash_rejection` inspects the command before it runs. Everything the agent
+    composes for itself goes through `_run_argv` or `_git`, which never involve
+    a shell at all.
+    """
+    return _run_argv_text(["/bin/bash", "-c", command], timeout=timeout, cwd=cwd)
+
+
+def _run_argv_text(argv: list[str], timeout: int = CMD_TIMEOUT_SEC, cwd: str | None = None,
+                   env: dict[str, str] | None = None) -> str:
+    """`_run_argv` shaped as the single output string most callers want."""
+    code, out = _run_argv(argv, timeout=timeout, cwd=cwd, env=env)
+    if code != 0:
+        return f"[exit {code}]\n{out}"
     return out
+
+
+def _git(args: list[str], timeout: int = 30, cwd: str | None = None) -> str:
+    """Run one git plumbing command in the repository. No shell involved."""
+    return _run_argv_text(["git", *args], timeout=timeout, cwd=cwd or _repo_root())
 
 
 def _run_argv(
@@ -568,6 +585,10 @@ class DbSpec:
         self.no_materialize: bool = False     # "Do not materialize ... in Python"
         self.no_side_effects: bool = False    # "Do not add database writes, ... side effects"
         self.results_must_not_change: bool = False  # optimization: same rows, less work
+        # The contract says something about how much database work is allowed. When it
+        # does, the number is a fact to be measured, not a property to be reasoned about.
+        self.query_bound_matters: bool = False
+        self.query_bound: int | None = None      # the bound, when the prose states one
 
     @property
     def target(self) -> str | None:
@@ -614,7 +635,7 @@ def _existing_rel(candidate: str) -> str | None:
     # Last resort: a unique tracked file with that suffix.
     hits = [
         line.strip()
-        for line in _run(f"git ls-files -- '*{shlex.quote(base)}'", timeout=25).splitlines()
+        for line in _git(["ls-files", "--", f"*{base}"], timeout=25).splitlines()
         if line.strip()
     ]
     hits = [h for h in hits if h.endswith(base)]
@@ -795,6 +816,21 @@ def _detect_spec(problem: str) -> DbSpec | None:
     spec.results_must_not_change = spec.kind == "optimization" or bool(
         re.search(r"without changing (?:its|the) result|same lazy queryset|results? (?:must|should) not change", low)
     )
+    spec.query_bound_matters = bool(
+        re.search(
+            r"bounded number of sql|number of (?:sql )?quer|query count|n\+1|database round|"
+            r"one database query|single (?:sql )?statement|independent of how many|"
+            r"does not (?:grow|scale) with|prefetch|select_related|bounded query",
+            low,
+        )
+    )
+    stated = re.search(r"(?:at most|no more than|fewer than|under)\s+(\d+)\s+(?:sql\s+)?quer", low)
+    if stated:
+        spec.query_bound = int(stated.group(1))
+        spec.query_bound_matters = True
+    elif re.search(r"\bone database query\b|\bone query\b|\ba single (?:sql )?(?:query|statement)\b", low):
+        spec.query_bound = 1
+        spec.query_bound_matters = True
     return spec
 
 
@@ -1416,8 +1452,7 @@ def _run_declared_check(command: str) -> tuple[bool, str]:
     if argv:
         code, out = _run_argv(argv, timeout=budget, cwd=_repo_root(), env=env)
     else:
-        out = _run(command, timeout=budget, cwd=_repo_root())
-        code = 1 if out.startswith("[exit") else 0
+        code, out = 127, f"[could not parse the command the instruction gives: {command}]"
     _clean_repo_junk()
     if code == 124:
         # A timeout is not evidence of a broken patch; saying it is sends the
@@ -1491,8 +1526,9 @@ _JUNK_DIR_NAMES = {"__pycache__", ".ruff_cache", ".pytest_cache", ".mypy_cache",
 _PRUNE_DIR_NAMES = {".git", "node_modules", ".venv", "venv", ".tox", ".nox", "build", "dist"}
 
 
-def _git_paths(command: str) -> list[str]:
-    out = _run(command, timeout=30, cwd=_repo_root())
+def _git_paths(args: list[str]) -> list[str]:
+    """Run a git command that emits NUL-separated paths, and split them."""
+    out = _git(args, timeout=30)
     if out.startswith("[exit") or out.startswith("[command"):
         return []
     return [part for part in out.split("\0") if part.strip()]
@@ -1500,8 +1536,8 @@ def _git_paths(command: str) -> list[str]:
 
 def _changed_paths() -> list[str]:
     """Every repo path the patch would carry: tracked edits plus untracked files."""
-    paths = _git_paths("git diff --name-only -z HEAD")
-    paths += _git_paths("git ls-files --others --exclude-standard -z")
+    paths = _git_paths(["diff", "--name-only", "-z", "HEAD"])
+    paths += _git_paths(["ls-files", "--others", "--exclude-standard", "-z"])
     seen: list[str] = []
     for path in paths:
         if path not in seen:
@@ -1534,10 +1570,9 @@ def _clean_repo_junk() -> None:
     pairs = [(path, rel) for path, rel in ((p, _rel_to_repo(p)) for p in junk) if rel]
     if not pairs:
         return
-    quoted = " ".join(shlex.quote(rel) for _path, rel in pairs)
     # `git ls-files` lists tracked FILES, so a junk directory is off-limits when any
     # tracked path lives inside it.
-    tracked = set(_git_paths(f"git ls-files -z -- {quoted}"))
+    tracked = set(_git_paths(["ls-files", "-z", "--", *(rel for _path, rel in pairs)]))
     for path, rel in pairs:
         if rel in tracked or any(entry.startswith(rel + "/") for entry in tracked):
             continue
@@ -1567,8 +1602,7 @@ def _revert_out_of_scope() -> list[str]:
     reverted: list[str] = []
     for path in _scope_violations():
         absolute = os.path.join(_repo_root(), path)
-        quoted = shlex.quote(path)
-        if _run(f"git ls-files --error-unmatch -- {quoted}", timeout=20, cwd=_repo_root()).startswith("[exit"):
+        if _git(["ls-files", "--error-unmatch", "--", path], timeout=20).startswith("[exit"):
             try:
                 if os.path.isdir(absolute) and not os.path.islink(absolute):
                     shutil.rmtree(absolute, ignore_errors=True)
@@ -1578,7 +1612,7 @@ def _revert_out_of_scope() -> list[str]:
             except OSError:
                 pass
         else:
-            _run(f"git checkout -- {quoted}", timeout=30, cwd=_repo_root())
+            _git(["checkout", "--", path], timeout=30)
             reverted.append(path)
     if reverted:
         _log(f"reverted changes outside the file the instruction names: {reverted}")
@@ -1645,7 +1679,7 @@ def _dsn_candidates() -> list[dict[str, Any]]:
         value = os.getenv(var)
         if value:
             add("clickhouse" if value.startswith("clickhouse") else "postgresql", value)
-    if os.getenv("PGHOST") or os.getenv("PGDATABASE"):
+    if os.getenv("PGHOST", "") or os.getenv("PGDATABASE", ""):
         user = os.getenv("PGUSER", "postgres")
         password = os.getenv("PGPASSWORD", "")
         host = os.getenv("PGHOST", "localhost")
@@ -1677,14 +1711,13 @@ def _dsn_candidates() -> list[dict[str, Any]]:
                 add("postgresql", line)
 
     # Connection strings written into configuration files.
-    grep = _run(
-        "git grep -h -I -E -o \"(postgres(ql)?|clickhouse)://[^\\\"' ]+\" -- "
-        "':!*test*' ':!*docs*' | head -10",
+    grep = _git(
+        ["grep", "-h", "-I", "-E", "-o", r"(postgres(ql)?|clickhouse)://[^\"' ]+",
+         "--", ":!*test*", ":!*docs*"],
         timeout=30,
-        cwd=_repo_root(),
     )
     if not grep.startswith("[exit") and not grep.startswith("[command"):
-        for line in grep.splitlines():
+        for line in grep.splitlines()[:10]:
             line = line.strip()
             if "://" in line and "$" not in line and "{" not in line:
                 add("clickhouse" if line.startswith("clickhouse") else "postgresql", line)
@@ -1785,6 +1818,80 @@ def _wrap_rolled_back(code: str) -> str:
     )
 
 
+def _wrap_query_count(code: str) -> str:
+    """Count the statements a piece of application code actually issues.
+
+    "How many queries does this path run" is a fact about the database, not
+    about how the code reads, and it cannot be settled by inspection: an ORM
+    expression that looks like one statement issues one per row the moment
+    something in it is evaluated eagerly. This measures it with the
+    instrumentation the application's own test suite uses, so the number here
+    is the number a test asserting a bound would see.
+
+    Transaction bookkeeping (SAVEPOINT and friends) is reported separately from
+    the statements the code actually asked for, because a bound is about the
+    latter.
+    """
+    body = textwrap.indent(code, " " * 12)
+    return (
+        "from django.db import connection, transaction\n"
+        "from django.test.utils import CaptureQueriesContext\n"
+        "class _RollBack(Exception):\n"
+        "    pass\n"
+        "_bookkeeping = ('SAVEPOINT', 'RELEASE SAVEPOINT', 'ROLLBACK TO SAVEPOINT', 'BEGIN', 'COMMIT')\n"
+        "try:\n"
+        "    with transaction.atomic():\n"
+        "        with CaptureQueriesContext(connection) as _captured:\n"
+        f"{body}\n"
+        "        _all = [q['sql'] for q in _captured]\n"
+        "        _real = [s for s in _all if not s.strip().upper().startswith(_bookkeeping)]\n"
+        "        print('[queries] %d statement(s); %d after removing transaction bookkeeping'\n"
+        "              % (len(_all), len(_real)))\n"
+        "        for _i, _s in enumerate(_real, 1):\n"
+        "            print('  %d. %s' % (_i, _s[:400]))\n"
+        "        raise _RollBack\n"
+        "except _RollBack:\n"
+        "    pass\n"
+    )
+
+
+# Whether this run has actually measured the query work of the path it changed.
+# On a task whose contract states a bound, an unmeasured patch is a guess.
+_QUERY_STATE = {"runs": 0, "last_count": None, "nudged": False}
+
+
+def _tool_count_queries(code: str) -> str:
+    """Measure how many statements a snippet issues, and show them."""
+    if not (code or "").strip():
+        return (
+            "[count_queries needs a `code` snippet that exercises the path, e.g. "
+            "`list(Model.objects.some_method())`]"
+        )
+    manage = _manage_py()
+    if not manage:
+        return (
+            "[count_queries needs the application's own instrumentation and this project does "
+            "not expose a Django entry point. Measure it the way the project's tests do.]"
+        )
+    budget = max(30, min(180, int(_time_left() - 40)))
+    code_rc, out = _run_argv(
+        [_python_bin(), os.path.join(_repo_root(), manage), "shell", "-c", _wrap_query_count(code)],
+        timeout=budget,
+        cwd=_repo_root(),
+        env=_subprocess_env(_import_roots()),
+    )
+    _clean_repo_junk()
+    if code_rc == 124:
+        return "[count_queries: the snippet did not finish in time; make it smaller]"
+    if code_rc != 0:
+        return f"[exit {code_rc}]\n" + _truncate(out, 2000)
+    _QUERY_STATE["runs"] += 1
+    match = re.search(r"\[queries\] \d+ statement\(s\); (\d+) after", out or "")
+    if match:
+        _QUERY_STATE["last_count"] = int(match.group(1))
+    return _truncate(out.strip() or "[no output]", 2600)
+
+
 def _tool_app_shell(code: str, rollback: Any = True) -> str:
     """Evaluate a snippet inside the application, against the live database."""
     if not (code or "").strip():
@@ -1846,14 +1953,22 @@ def _ensure_unpatched_copy() -> bool:
         os.makedirs(UNPATCHED_COPY, exist_ok=True)
     except OSError:
         return False
-    out = _run(
-        f"git archive --format=tar HEAD | tar -x -C {shlex.quote(UNPATCHED_COPY)}",
-        timeout=180,
-        cwd=_repo_root(),
-    )
+    archive = os.path.join(SCRATCH_DIR, "baseline.tar")
+    out = _git(["archive", "--format=tar", "-o", archive, "HEAD"], timeout=180)
     if out.startswith("[exit") or out.startswith("[command"):
         _log(f"baseline tree unavailable: {out.strip()[:200]}")
         return False
+    try:
+        with tarfile.open(archive) as handle:
+            handle.extractall(UNPATCHED_COPY, filter="data")
+    except Exception as exc:  # noqa: BLE001
+        _log(f"baseline tree could not be unpacked: {exc}")
+        return False
+    finally:
+        try:
+            os.remove(archive)
+        except OSError:
+            pass
     _UNPATCHED_COPY_READY = True
     return True
 
@@ -1993,7 +2108,7 @@ def _rank_candidate_files(problem: str) -> list[tuple[str, int]]:
         return []
     counts: dict[str, int] = {}
     for term in terms[:18]:
-        out = _run(f"git grep -l -F -- {shlex.quote(term)}", timeout=20, cwd=_repo_root())
+        out = _git(["grep", "-l", "-F", "--", term], timeout=20)
         if out.startswith("[exit") or out.startswith("[command"):
             continue
         for path in out.splitlines():
@@ -2006,7 +2121,7 @@ def _rank_candidate_files(problem: str) -> list[tuple[str, int]]:
     defines: dict[str, int] = {}
     for term in terms[:10]:
         pattern = r"^[[:space:]]*(def|class|func|function|const|type)[[:space:]]+" + term + r"\b"
-        out = _run(f"git grep -l -E -- {shlex.quote(pattern)}", timeout=20, cwd=_repo_root())
+        out = _git(["grep", "-l", "-E", "--", pattern], timeout=20)
         if out.startswith("[exit") or out.startswith("[command"):
             continue
         for path in out.splitlines():
@@ -2188,6 +2303,26 @@ _DB_TOOLS = [
                 "and to check a result against rows you create for the occasion (ties, NULLs, "
                 "empty groups, duplicates). Everything the snippet does to the database is "
                 "rolled back afterwards, so create whatever rows you need."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"code": {"type": "string"}},
+                "required": ["code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "count_queries",
+            "description": (
+                "Measure how many SQL statements a piece of code actually issues, and show "
+                "them. Give a snippet that exercises the path end to end, e.g. "
+                "`list(Model.objects.the_method(...))`. Use this whenever the task says "
+                "anything about query count, bounded queries, N+1 or round trips: how a "
+                "queryset reads is not evidence of how many statements it runs, and this is "
+                "the same instrumentation the project's own tests use. Everything the snippet "
+                "writes is rolled back."
             ),
             "parameters": {
                 "type": "object",
@@ -2512,7 +2647,7 @@ def _dispatch_tool(name: str, args: dict) -> str:
             if rejection:
                 _log(f"refused a command: {command[:120]}")
                 return rejection
-            out = _run(command, timeout=min(CMD_TIMEOUT_SEC, max(20, int(_time_left() - 20))), cwd=_repo_root())
+            out = _run_shell(command, timeout=min(CMD_TIMEOUT_SEC, max(20, int(_time_left() - 20))), cwd=_repo_root())
             _clean_repo_junk()
             return _truncate(out)
         if name == "find_files":
@@ -2536,6 +2671,8 @@ def _dispatch_tool(name: str, args: dict) -> str:
             return _tool_db_explain(args.get("sql", ""))
         if name == "app_shell":
             return _tool_app_shell(args.get("code", ""))
+        if name == "count_queries":
+            return _tool_count_queries(args.get("code", ""))
         if name == "compare_results":
             return _tool_compare_results(args.get("code", ""))
         if name == "check_requirements":
@@ -2642,7 +2779,7 @@ def _verify_patch(run_checks: bool = True) -> tuple[bool, str]:
 def _has_changes() -> bool:
     if _SPEC is not None:
         return bool([p for p in _changed_paths() if _in_scope(p)])
-    return bool(_run("git status --porcelain", timeout=30, cwd=_repo_root()).strip())
+    return bool(_git(["status", "--porcelain"], timeout=30).strip())
 
 
 _SCRATCH_RE = re.compile(
@@ -2658,7 +2795,7 @@ def _remove_scratch_files() -> None:
     files with scratch names are removed, so a genuine new project file is never
     touched.
     """
-    out = _run("git ls-files --others --exclude-standard", timeout=30, cwd=_repo_root())
+    out = _git(["ls-files", "--others", "--exclude-standard"], timeout=30)
     if out.startswith("[exit") or out.startswith("[command"):
         return
     for path in out.splitlines():
@@ -2680,9 +2817,7 @@ def _validate_applies(diff: str) -> bool:
             handle.write(diff)
     except Exception:  # noqa: BLE001
         return False
-    res = _run(
-        f"git apply --check --whitespace=nowarn {shlex.quote(patch_path)}", timeout=60, cwd=_repo_root()
-    )
+    res = _git(["apply", "--check", "--whitespace=nowarn", patch_path], timeout=60)
     return not res.startswith("[exit")
 
 
@@ -2699,12 +2834,12 @@ def _make_diff() -> str:
         _revert_out_of_scope()
         # Stage the one file and nothing else, so even a revert that failed
         # (permissions, a path git refuses to touch) cannot reach the submission.
-        _run("git add -A -- " + " ".join(shlex.quote(p) for p in _SPEC.scope), timeout=60, cwd=_repo_root())
+        _git(["add", "-A", "--", *_SPEC.scope], timeout=60)
     else:
-        _run("git add -A", timeout=60, cwd=_repo_root())
-    diff = _run("git diff --cached", timeout=60, cwd=_repo_root())
-    _run("git reset -q --hard HEAD", timeout=60, cwd=_repo_root())
-    _run("git clean -fdq", timeout=60, cwd=_repo_root())
+        _git(["add", "-A"], timeout=60)
+    diff = _git(["diff", "--cached"], timeout=60)
+    _git(["reset", "-q", "--hard", "HEAD"], timeout=60)
+    _git(["clean", "-fdq"], timeout=60)
     if diff.strip():
         if _validate_applies(diff):
             _log("patch validated: applies cleanly to the unpatched tree")
@@ -2748,6 +2883,7 @@ QUERY ENGINEERING PLAYBOOK (general technique; apply what fits):
 - DISTINCT COUNTS. COUNT(DISTINCT x) after a fan-out join is right for the distinct thing and wrong for the total; the requirements usually want one of each ("duplicate parents count once, duplicate children count individually"). Read which.
 - HIERARCHIES. Containment/ancestry is a set predicate, not a loop: a self-join on the containment operator, or a recursive CTE. Exclude the row itself when the requirement says "strict". Keep the partitioning column (tenant, VRF, workspace) in the join condition or rows from different partitions leak into each other.
 - N+1. Query work that grows with the size of the selection is the defect. Replace "resolve the ids, then ask again per id" with ONE set-based statement: a join, an IN over a subquery, or EXISTS. Keep it lazy -- the moment you evaluate a queryset to build the next one, you have made the extra query.
+- COUNTING STATEMENTS IS A MEASUREMENT. If the contract bounds the database work, run count_queries on the path and read the number. An expression that reads as one statement issues one per row as soon as anything in it is evaluated eagerly, and `.exists()`, `.count()`, `list(...)`, `values_list(...)`, indexing and iterating are all evaluation. Measure before you claim, and measure again after you change it.
 - INDEXES. An index serves a predicate only when its leading columns match the predicate's columns. A prefix-only index still scans everything for the second column. A partial index must cover the predicate. Never assert an index is used: db_explain and read whether the plan names it and what the buffer counts are.
 - CLICKHOUSE. No unique constraints and no transactions: duplicates are the caller's problem, FINAL or an aggregate resolves them. The ORDER BY key decides what can be skipped; PREWHERE cuts columns read; uniqExact is exact where uniq is approximate.
 - MIGRATIONS. A migration must apply to a fresh schema AND leave the state consistent with the model. Keep the dependency, the model and the index name; change only what the predicate needs.
@@ -2870,6 +3006,12 @@ def _db_user_message(problem_statement: str) -> str:
         constraints.append("nothing is materialized in Python")
     if _SPEC.results_must_not_change:
         constraints.append("the rows that come back must be identical to the rows that come back now")
+    if _SPEC.query_bound_matters:
+        constraints.append(
+            "the database work is part of the contract"
+            + (f": at most {_SPEC.query_bound} statement(s) on that path" if _SPEC.query_bound else "")
+            + " -- measure it with count_queries, do not infer it"
+        )
     if constraints:
         blocks.append("  Constraints: " + "; ".join(constraints) + ".")
     if _SPEC.checks:
@@ -2908,16 +3050,22 @@ def _db_user_message(problem_statement: str) -> str:
         "",
         "# How to start (do these before rewriting anything)",
         "  1. read_file the target method and the model it queries.",
-        "  2. db_sql the schema behind it: the columns, their types and nullability, and the "
-        "indexes. Types decide these tasks -- integer division truncates, a nullable column "
-        "will not compare the way you expect.",
-        "  3. app_shell: print(str(<the current queryset>.query)) and look at the SQL the code "
-        "actually produces today.",
+        (
+            "  2. db_sql the schema behind it: the columns, their types and nullability, and "
+            "the indexes. Types decide these tasks -- integer division truncates, a nullable "
+            "column will not compare the way you expect."
+        ),
+        (
+            "  3. app_shell: print(str(<the current queryset>.query)) and look at the SQL the "
+            "code actually produces today."
+        ),
         "  4. Only now write the change.",
-        "  5. app_shell again to prove it: create the awkward rows the requirements name (a tie, "
-        "a NULL, an empty group, a duplicate, a boundary) and print what the query returns for "
-        "each. Everything you create is rolled back. This is the step that decides the task, "
-        "because the result is judged on rows you were never shown.",
+        (
+            "  5. app_shell again to prove it: create the awkward rows the requirements name (a "
+            "tie, a NULL, an empty group, a duplicate, a boundary) and print what the query "
+            "returns for each. Everything you create is rolled back. This is the step that "
+            "decides the task, because the result is judged on rows you were never shown."
+        ),
         (
             "  6. check_requirements after each edit (it includes the linter and is instant), "
             "then run_checks once you believe you are done, then finish."
@@ -2930,7 +3078,7 @@ def _initial_user_message(problem_statement: str) -> str:
     if _SPEC is not None:
         return _db_user_message(problem_statement)
     hint = _localization_hint(problem_statement)
-    tree = _truncate(_run("git ls-files | head -200", timeout=30, cwd=_repo_root()), 2500)
+    tree = _truncate("\n".join(_git(["ls-files"], timeout=30).splitlines()[:200]), 2500)
     blocks = [
         f"Application root = your current working directory: {_repo_root()}",
         "All paths below are relative to it. Do NOT guess other locations.",
@@ -2957,6 +3105,138 @@ def _initial_user_message(problem_statement: str) -> str:
 # Main loop
 # --------------------------------------------------------------------------- #
 
+# What this run has actually learned, as opposed to what it has done. Kept as
+# plain counters rather than a model-maintained scratchpad: the point is to
+# notice, without asking the model, that the last several actions produced no
+# new information. Measured on the baseline, that is exactly what separates a
+# solved task from a failed one -- the failures searched twice as much and
+# edited twice as often, while learning no more.
+_RUN_STATE: dict[str, Any] = {
+    "files_seen": set(),
+    "commands_seen": set(),
+    "searches_since_progress": 0,
+    "edits": 0,
+    "last_failure": None,
+    "repeat_failures": 0,
+    "recoveries": 0,
+}
+
+MAX_RECOVERIES = int(os.getenv("RIDGES_MAX_RECOVERIES", "2"))
+SEARCHES_WITHOUT_PROGRESS = int(os.getenv("RIDGES_STUCK_SEARCHES", "8"))
+REPEATED_FAILURES = int(os.getenv("RIDGES_STUCK_FAILURES", "3"))
+
+
+def _reset_run_state() -> None:
+    _RUN_STATE.update({
+        "files_seen": set(), "commands_seen": set(), "searches_since_progress": 0,
+        "edits": 0, "last_failure": None, "repeat_failures": 0, "recoveries": 0,
+    })
+
+
+def _note_action(name: str, args: dict, result: str) -> None:
+    """Record whether this action taught the run anything it did not know."""
+    if name in ("edit_file", "create_file"):
+        if not result.startswith("[write rejected") and not result.startswith("[edit failed"):
+            _RUN_STATE["edits"] += 1
+            _RUN_STATE["searches_since_progress"] = 0
+        return
+    if name == "read_file":
+        path = str(args.get("path") or "")
+        if path and path not in _RUN_STATE["files_seen"]:
+            _RUN_STATE["files_seen"].add(path)
+            _RUN_STATE["searches_since_progress"] = 0
+        else:
+            _RUN_STATE["searches_since_progress"] += 1
+        return
+    if name in ("bash", "find_files"):
+        key = str(args.get("command") or args.get("query") or "")[:200]
+        # A command this run has already issued cannot return news.
+        if key and key in _RUN_STATE["commands_seen"]:
+            _RUN_STATE["searches_since_progress"] += 2
+        else:
+            _RUN_STATE["commands_seen"].add(key)
+            _RUN_STATE["searches_since_progress"] += 1
+        return
+    if name in ("db_sql", "db_explain", "app_shell", "count_queries", "compare_results"):
+        # Asking the database something is the kind of evidence that resolves
+        # these tasks, so it counts as progress.
+        _RUN_STATE["searches_since_progress"] = 0
+
+
+def _note_failure(report: str) -> None:
+    """Track whether the same thing keeps failing for the same reason."""
+    signature = "|".join(
+        line.split("--")[0].strip()
+        for line in (report or "").splitlines()
+        if line.strip().isupper() or " FAILED" in line
+    )[:400]
+    if signature and signature == _RUN_STATE["last_failure"]:
+        _RUN_STATE["repeat_failures"] += 1
+    else:
+        _RUN_STATE["last_failure"] = signature
+        _RUN_STATE["repeat_failures"] = 0
+
+
+def _stuck_reason() -> str | None:
+    """Why this run looks stuck, in its own terms, or None."""
+    if _RUN_STATE["recoveries"] >= MAX_RECOVERIES:
+        return None
+    if _RUN_STATE["searches_since_progress"] >= SEARCHES_WITHOUT_PROGRESS:
+        return (
+            f"{_RUN_STATE['searches_since_progress']} look-ups in a row have turned up nothing "
+            "you had not already seen"
+        )
+    if _RUN_STATE["repeat_failures"] >= REPEATED_FAILURES:
+        return "the same check has now failed the same way several times running"
+    return None
+
+
+def _recovery_brief(reason: str) -> str:
+    """Stop, say what is actually known, and change one thing.
+
+    Deliberately assembled from this run's own record rather than asked of the
+    model: a model that has lost the thread is the last thing to trust for a
+    summary of why.
+    """
+    files = sorted(_RUN_STATE["files_seen"])[:8]
+    lines = [
+        f"STOP. {reason}. Searching more will not fix that; a wrong assumption will.",
+        "",
+        "What this run has actually done:",
+        f"  files opened: {', '.join(files) if files else 'none'}",
+        f"  edits made: {_RUN_STATE['edits']}",
+        f"  look-ups since anything new: {_RUN_STATE['searches_since_progress']}",
+    ]
+    if _QUERY_STATE["last_count"] is not None:
+        lines.append(f"  last measured query count: {_QUERY_STATE['last_count']}")
+    if _RUN_STATE["last_failure"]:
+        lines.append(f"  what keeps failing: {_RUN_STATE['last_failure'][:200]}")
+    if _SPEC is not None:
+        lines += [
+            "",
+            "What the instruction actually asked for:",
+            f"  change only {_scope_label()}"
+            + (f", inside {_SPEC.target}()" if _SPEC.target else ""),
+        ]
+        if _SPEC.query_bound is not None:
+            lines.append(f"  at most {_SPEC.query_bound} database statement(s) on that path")
+        for bullet in _REQUIREMENTS[:6]:
+            lines.append(f"  - {bullet[:160]}")
+    lines += [
+        "",
+        "Do this, in order, and nothing else:",
+        "  1. Name the ONE assumption you have been working from that is most likely wrong.",
+        "     Relationship direction, what a row means, what is NULL, when the query is",
+        "     evaluated, or which code path the caller actually runs.",
+        "  2. Check that one assumption directly against the database or the model",
+        "     definition (db_sql, app_shell, count_queries), not against another search.",
+        "  3. Only then change code, and change the smallest thing that follows from what",
+        "     you just learned. If your earlier edit came from the assumption that turned",
+        "     out to be wrong, undo it rather than stacking another edit on top of it.",
+    ]
+    return "\n".join(lines)
+
+
 def _handle_finish_db(args: dict, state: dict) -> tuple[bool, str]:
     """Only let the run end when the work matches the instruction."""
     if not _has_changes():
@@ -2977,6 +3257,7 @@ def _handle_finish_db(args: dict, state: dict) -> tuple[bool, str]:
             _log("finish accepted unresolved: repair budget exhausted")
             return True, "[finished with unresolved items; returning best effort]"
         state["verify_repairs"] += 1
+        _note_failure(report)
         _log(f"finish rejected, needs repair ({state['verify_repairs']}/{MAX_VERIFY_REPAIRS})")
         return False, (
             "[finish rejected: the patch does not satisfy the instruction yet. Fix these, then "
@@ -3008,6 +3289,33 @@ def _handle_finish_db(args: dict, state: dict) -> tuple[bool, str]:
                 "to test, not the grain, the ties and the empty cases your rewrite touched. Write "
                 "one snippet that prints the results for the ordinary case AND the edge cases the "
                 "requirements name, run compare_results, then finish."
+            )
+
+    # A stated bound on database work is a number. Claiming it without having
+    # measured it is how this run loses a task it otherwise solved: the patch
+    # looks set-based, reads as one statement, and issues five.
+    if _SPEC is not None and _SPEC.query_bound_matters:
+        measured = _QUERY_STATE["last_count"]
+        bound = _SPEC.query_bound
+        if _QUERY_STATE["runs"] == 0 and not _QUERY_STATE["nudged"] and _time_left() > 120:
+            _QUERY_STATE["nudged"] = True
+            blockers.append(
+                "QUERY WORK: this task's contract is about how much database work the path "
+                "does, and you have not measured it. Reading the expression is not evidence. "
+                "Run count_queries on the path you changed, exercising it the way a caller "
+                "would, and check the number against what the instruction allows."
+            )
+        elif (
+            measured is not None
+            and bound is not None
+            and measured > bound
+            and state["verify_repairs"] < MAX_VERIFY_REPAIRS
+        ):
+            state["verify_repairs"] += 1
+            blockers.append(
+                f"QUERY WORK: your last measurement was {measured} statement(s) and the "
+                f"instruction allows at most {bound}. Find what is still being evaluated per "
+                "row and fold it into the single statement, then measure again."
             )
 
     checklist = _checklist_failures(args)
@@ -3133,9 +3441,10 @@ def _run_agent(problem_statement: str, attempt: int = 0, previous_report: str = 
                     finished, result = _handle_finish_general(args, state)
             else:
                 _log(f"step {step}: {name} {json.dumps(args)[:160]}")
-                if name in ("db_sql", "db_explain", "app_shell", "compare_results"):
+                if name in ("db_sql", "db_explain", "app_shell", "compare_results", "count_queries"):
                     db_tools_used = True
                 result = _dispatch_tool(name, args)
+                _note_action(name, args, result)
                 # A command that writes outside the allowed file forfeits the whole
                 # task, so surface it the moment it happens rather than at finish,
                 # when the model may have no budget left to undo it.
@@ -3153,6 +3462,14 @@ def _run_agent(problem_statement: str, attempt: int = 0, previous_report: str = 
 
         if finished:
             break
+
+        reason = _stuck_reason() if _SPEC is not None else None
+        if reason:
+            _RUN_STATE["recoveries"] += 1
+            _RUN_STATE["searches_since_progress"] = 0
+            _RUN_STATE["repeat_failures"] = 0
+            _log(f"recovery {_RUN_STATE['recoveries']}/{MAX_RECOVERIES}: {reason}")
+            messages.append({"role": "user", "content": _recovery_brief(reason)})
 
         if _SPEC is not None and not db_tools_used and not db_nudged and _budget_used_fraction(step) >= 0.25:
             db_nudged = True
@@ -3306,6 +3623,8 @@ def _reset_attempt_state() -> None:
     """
     global _SLOW_CHECK_RUNS
     _COMPARE_STATE.update({"runs": 0, "diverged": False, "nudged": False})
+    _QUERY_STATE.update({"runs": 0, "last_count": None, "nudged": False})
+    _reset_run_state()
     _CHECKLIST_STATE["nudged"] = False
     _LAST_VERIFY.clear()
     _SLOW_CHECK_RUNS = 0
