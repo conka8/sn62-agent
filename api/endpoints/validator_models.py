@@ -1,0 +1,135 @@
+from typing import Any, List, Optional
+from uuid import UUID
+
+from pydantic import BaseModel, Field
+
+from models.evaluation_run import EvaluationRunStatus
+from models.openrouter import OpenRouterRuntimeConfig
+from models.problem import ProblemTestResult
+from utils.system_metrics import SystemMetrics
+
+
+class ValidatorRegistrationRequest(BaseModel):
+    timestamp: int
+    signed_timestamp: str
+    hotkey: str
+    commit_hash: str
+
+
+class ValidatorRegistrationResponse(BaseModel):
+    session_id: UUID
+    running_agent_timeout_seconds: int
+    running_eval_timeout_seconds: int
+    max_evaluation_run_log_size_bytes: int
+    environment_build_timeout_multiplier: float = 1.0
+
+
+class ScreenerRegistrationRequest(BaseModel):
+    name: str
+    password: str
+    commit_hash: str
+
+
+class ScreenerRegistrationResponse(BaseModel):
+    session_id: UUID
+    running_agent_timeout_seconds: int
+    running_eval_timeout_seconds: int
+    max_evaluation_run_log_size_bytes: int
+    environment_build_timeout_multiplier: float = 1.0
+
+
+class ValidatorRequestEvaluationRequest(BaseModel):
+    pass
+
+
+class ValidatorRequestEvaluationResponseEvaluationRun(BaseModel):  # :(
+    evaluation_run_id: UUID
+    problem_name: str
+    problem_suite_name: str | None = None
+    benchmark_family: str | None = None
+    execution_spec: dict[str, Any] | None = None
+
+
+class ValidatorRequestEvaluationResponse(BaseModel):
+    evaluation_id: UUID
+    agent_id: UUID
+    agent_code: str
+    evaluation_runs: List[ValidatorRequestEvaluationResponseEvaluationRun]
+    artifact_upload_urls: dict[str, str] = Field(default_factory=dict)
+    openrouter_config: OpenRouterRuntimeConfig | None = None
+
+
+class ValidatorTaskDownloadUrlRequest(BaseModel):
+    task_digest: str
+
+
+class ValidatorTaskDownloadUrlResponse(BaseModel):
+    url: str
+
+
+class ValidatorHeartbeatRequest(BaseModel):
+    system_metrics: SystemMetrics
+
+
+class ValidatorHeartbeatResponse(BaseModel):
+    pass
+
+
+class ValidatorCheckCancellationRequest(BaseModel):
+    evaluation_id: UUID
+    agent_id: UUID
+
+
+class ValidatorCheckCancellationResponse(BaseModel):
+    should_cancel: bool
+    reason: str | None = None
+
+
+class ValidatorCancelCurrentEvaluationRequest(BaseModel):
+    evaluation_id: UUID
+    agent_id: UUID
+    reason: str | None = None
+
+
+class ValidatorCancelCurrentEvaluationResponse(BaseModel):
+    pass
+
+
+class ValidatorUpdateEvaluationRunRequest(BaseModel):
+    evaluation_run_id: UUID
+    updated_status: EvaluationRunStatus
+
+    patch: Optional[str] = None
+    test_results: Optional[List[ProblemTestResult]] = None
+    verifier_reward: Optional[float] = None
+
+    agent_logs: Optional[str] = None
+    eval_logs: Optional[str] = None
+
+    error_code: Optional[int] = None
+    error_message: Optional[str] = None
+    cost_usd: Optional[float] = None
+
+
+class ValidatorUpdateEvaluationRunResponse(BaseModel):
+    # Set on error updates when the platform wants this run re-executed as a
+    # fresh attempt instead of failing the whole evaluation.
+    retry: bool = False
+    attempt_number: Optional[int] = None
+    artifact_upload_url: Optional[str] = None
+
+
+class ValidatorDisconnectRequest(BaseModel):
+    reason: str
+
+
+class ValidatorDisconnectResponse(BaseModel):
+    pass
+
+
+class ValidatorFinishEvaluationRequest(BaseModel):
+    pass
+
+
+class ValidatorFinishEvaluationResponse(BaseModel):
+    pass

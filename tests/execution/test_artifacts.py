@@ -1,0 +1,775 @@
+from pathlib import Path
+
+import pytest
+
+from execution.artifacts import read_trial_snapshot, result_from_summary
+from execution.errors import EvaluationRunException
+from models.evaluation_run import EvaluationRunErrorCode
+from ridges_harbor._stdlib_contract import (
+    PATCH_APPLY_LOG_FILENAME,
+    RUNTIME_PAYLOAD_FILENAME,
+    SETUP_LOG_FILENAME,
+)
+
+from .helpers import (
+    make_summary,
+    successful_report_payload,
+    successful_test_results,
+    successful_verifier_result,
+    write,
+    write_json,
+)
+
+
+def test_happy_path_returns_execution_result(tmp_path: Path) -> None:
+    summary = make_summary(
+        tmp_path,
+        test_results=successful_test_results(),
+        eval_log="verifier output",
+        verifier_result=successful_verifier_result(),
+    )
+
+    result = result_from_summary(summary)
+
+    assert result.backend == "harbor"
+    assert result.patch == "--- a/status.txt\n+++ b/status.txt\n@@ -1 +1 @@\n-pending\n+done\n"
+    assert result.verifier_reward == 1.0
+    assert len(result.test_results) == 1
+    assert result.test_results[0].name == "status updated"
+    assert result.agent_logs.startswith(f"# {SETUP_LOG_FILENAME}\nsetup ok")
+    assert f"# {RUNTIME_PAYLOAD_FILENAME}" not in result.agent_logs
+    assert result.eval_logs == "verifier output"
+
+
+def test_kubernetes_environment_labels_execution_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RIDGES_ENVIRONMENT_TYPE", "kubernetes")
+    summary = make_summary(
+        tmp_path,
+        test_results=successful_test_results(),
+        verifier_result=successful_verifier_result(),
+    )
+
+    result = result_from_summary(summary)
+
+    assert result.backend == "harbor-k8s"
+
+
+def test_proxy_usage_total_cost_is_attached_to_execution_result(tmp_path: Path) -> None:
+    summary = make_summary(
+        tmp_path,
+        test_results=successful_test_results(),
+        eval_log="verifier output",
+        verifier_result=successful_verifier_result(),
+    )
+    write_json(summary.job_dir / "proxy_data" / "proxy_usage.json", {"total_cost_usd": 1.25})
+
+    result = result_from_summary(summary)
+
+    assert result.cost_usd == 1.25
+
+
+def test_read_trial_snapshot_returns_patch_and_surfaced_agent_logs(tmp_path: Path) -> None:
+    summary = make_summary(
+        tmp_path,
+        test_results=successful_test_results(),
+        verifier_result=successful_verifier_result(),
+        runtime_log="runtime output",
+        trial_log="trial output",
+    )
+
+    snapshot = read_trial_snapshot(summary.trial_dir)
+
+    assert snapshot.patch == "--- a/status.txt\n+++ b/status.txt\n@@ -1 +1 @@\n-pending\n+done\n"
+    assert snapshot.agent_logs.startswith(f"# {SETUP_LOG_FILENAME}\nsetup ok")
+    assert "# runtime.log\nruntime output" in snapshot.agent_logs
+    assert "# trial.log\ntrial output" in snapshot.agent_logs
+
+
+def test_separate_verifier_returns_exact_patch_recorded_by_verifier(tmp_path: Path) -> None:
+    graded_patch = "--- a/status.txt\n+++ b/status.txt\n@@ -1 +1 @@\n-pending\n+verified\n"
+    summary = make_summary(
+        tmp_path,
+        separate_verifier=True,
+        graded_patch=graded_patch,
+        test_results=successful_test_results(),
+        verifier_result=successful_verifier_result(),
+    )
+
+    result = result_from_summary(summary)
+
+    assert result.patch == graded_patch
+
+
+def test_separate_verifier_rejects_success_without_graded_patch(tmp_path: Path) -> None:
+    summary = make_summary(
+        tmp_path,
+        separate_verifier=True,
+        test_results=successful_test_results(),
+        verifier_result=successful_verifier_result(),
+    )
+
+    with pytest.raises(EvaluationRunException) as exc_info:
+        result_from_summary(summary)
+
+    assert exc_info.value.error_code == EvaluationRunErrorCode.VALIDATOR_INTERNAL_ERROR
+
+
+def test_shared_verifier_keeps_agent_patch_authoritative(tmp_path: Path) -> None:
+    summary = make_summary(
+        tmp_path,
+        graded_patch="unexpected verifier copy",
+        test_results=successful_test_results(),
+        verifier_result=successful_verifier_result(),
+    )
+
+    result = result_from_summary(summary)
+
+    assert result.patch.startswith("--- a/status.txt")
+
+
+def test_report_json_fills_structured_test_results_when_legacy_file_is_missing(tmp_path: Path) -> None:
+    summary = make_summary(
+        tmp_path,
+        report_payload=successful_report_payload(),
+        eval_log="verifier output",
+        verifier_result=successful_verifier_result(),
+    )
+
+    result = result_from_summary(summary)
+
+    assert len(result.test_results) == 2
+    assert {test.name for test in result.test_results} == {"status updated", "regression check"}
+    assert {test.status.value for test in result.test_results} == {"pass"}
+    assert {test.category.value for test in result.test_results} == {"fail_to_pass", "pass_to_pass"}
+
+
+def test_zero_reward_returns_execution_result_with_report_failures(tmp_path: Path) -> None:
+    summary = make_summary(
+        tmp_path,
+        report_payload={
+            "update-status-file": {
+                "tests_status": {
+                    "FAIL_TO_PASS": {
+                        "success": [],
+                        "failure": ["status updated"],
+                    },
+                    "PASS_TO_PASS": {
+                        "success": ["regression check"],
+                        "failure": [],
+                    },
+                }
+            }
+        },
+        verifier_result={"rewards": {"reward": 0.0}},
+    )
+
+    result = result_from_summary(summary)
+
+    assert result.patch
+    assert result.verifier_reward == 0.0
+    assert [(test.name, test.status.value) for test in result.test_results] == [
+        ("status updated", "fail"),
+        ("regression check", "pass"),
+    ]
+
+
+def test_fractional_reward_returns_execution_result(tmp_path: Path) -> None:
+    summary = make_summary(
+        tmp_path,
+        test_results=successful_test_results(),
+        verifier_result={"rewards": {"reward": 0.8}},
+    )
+
+    result = result_from_summary(summary)
+
+    assert result.patch
+    assert result.verifier_reward == 0.8
+    assert len(result.test_results) == 1
+
+
+def test_runtime_log_is_included_in_agent_logs(tmp_path: Path) -> None:
+    summary = make_summary(
+        tmp_path,
+        exception_info={
+            "exception_type": "MinerInvalidPatchError",
+            "exception_message": "Miner returned an invalid patch",
+            "exception_traceback": "Traceback...\nridges_harbor/agents.py\n",
+        },
+        test_results=successful_test_results(),
+        run_log="[state] cancelled",
+        runtime_log="live runtime output",
+    )
+
+    with pytest.raises(EvaluationRunException) as exc_info:
+        result_from_summary(summary)
+
+    assert "live runtime output" in exc_info.value.extra["agent_logs"]
+
+
+def test_agent_timeout_surfaces_runtime_log_when_run_log_only_records_cancellation(tmp_path: Path) -> None:
+    summary = make_summary(
+        tmp_path,
+        exception_info={
+            "exception_type": "AgentTimeoutError",
+            "exception_message": "Agent execution timed out after 30 seconds",
+            "exception_traceback": "Traceback...\n_execute_agent\n",
+        },
+        agent_execution={
+            "started_at": "2026-04-09T00:00:00Z",
+            "finished_at": "2026-04-09T00:00:30Z",
+        },
+        run_log="[state] started\n[state] cancelled\n[detail] agent execution was cancelled, likely due to timeout",
+        runtime_log="streamed stdout before timeout",
+    )
+
+    with pytest.raises(EvaluationRunException) as exc_info:
+        result_from_summary(summary)
+
+    assert exc_info.value.error_code == EvaluationRunErrorCode.AGENT_TIMEOUT_RUNNING_AGENT
+    assert "streamed stdout before timeout" in exc_info.value.extra["agent_logs"]
+    assert "[state] cancelled" in exc_info.value.extra["agent_logs"]
+
+
+def test_verifier_reward_after_agent_timeout_scores_the_run(tmp_path: Path) -> None:
+    """Harbor's earlier agent timeout must not void its later verifier reward."""
+    summary = make_summary(
+        tmp_path,
+        exception_info={
+            "exception_type": "AgentTimeoutError",
+            "exception_message": "Agent execution timed out after 1500.0 seconds",
+            "exception_traceback": "Traceback...\n_execute_agent\n",
+        },
+        agent_execution={
+            "started_at": "2026-04-09T00:00:00Z",
+            "finished_at": "2026-04-09T00:25:00Z",
+        },
+        test_results=successful_test_results(),
+        eval_log="verifier output",
+        verifier_result=successful_verifier_result(),
+        patch_published=True,
+    )
+
+    result = result_from_summary(summary)
+
+    assert result.verifier_reward == 1.0
+
+
+def test_separate_verifier_timeout_partial_credit_requires_graded_patch(tmp_path: Path) -> None:
+    summary = make_summary(
+        tmp_path,
+        separate_verifier=True,
+        exception_info={
+            "exception_type": "AgentTimeoutError",
+            "exception_message": "Agent execution timed out after 30 seconds",
+            "exception_traceback": "Traceback...\n_execute_agent\n",
+        },
+        test_results=successful_test_results(),
+        verifier_result=successful_verifier_result(),
+        patch_published=True,
+    )
+
+    with pytest.raises(EvaluationRunException) as exc_info:
+        result_from_summary(summary)
+
+    assert exc_info.value.error_code == EvaluationRunErrorCode.AGENT_TIMEOUT_RUNNING_AGENT
+
+
+def test_separate_verifier_timeout_partial_credit_uses_graded_patch(tmp_path: Path) -> None:
+    graded_patch = "--- a/status.txt\n+++ b/status.txt\n@@ -1 +1 @@\n-pending\n+verified\n"
+    summary = make_summary(
+        tmp_path,
+        separate_verifier=True,
+        graded_patch=graded_patch,
+        exception_info={
+            "exception_type": "AgentTimeoutError",
+            "exception_message": "Agent execution timed out after 30 seconds",
+            "exception_traceback": "Traceback...\n_execute_agent\n",
+        },
+        test_results=successful_test_results(),
+        verifier_result=successful_verifier_result(),
+        patch_published=True,
+    )
+
+    result = result_from_summary(summary)
+
+    assert result.patch == graded_patch
+    assert result.verifier_reward == 1.0
+
+
+def test_zero_verifier_reward_after_agent_timeout_records_finished_zero(tmp_path: Path) -> None:
+    summary = make_summary(
+        tmp_path,
+        exception_info={
+            "exception_type": "AgentTimeoutError",
+            "exception_message": "Agent execution timed out after 1500.0 seconds",
+            "exception_traceback": "Traceback...\n_execute_agent\n",
+        },
+        test_results=successful_test_results(),
+        eval_log="verifier output",
+        verifier_result={"rewards": {"reward": 0.0}},
+        patch_published=True,
+    )
+
+    result = result_from_summary(summary)
+
+    assert result.verifier_reward == 0.0
+
+
+def test_agent_timeout_rejects_agent_written_patch_without_publication_marker(
+    tmp_path: Path,
+) -> None:
+    summary = make_summary(
+        tmp_path,
+        separate_verifier=True,
+        graded_patch="--- a/status.txt\n+++ b/status.txt\n@@ -1 +1 @@\n-pending\n+verified\n",
+        exception_info={
+            "exception_type": "AgentTimeoutError",
+            "exception_message": "Agent execution timed out after 30 seconds",
+            "exception_traceback": "Traceback...\n_execute_agent\n",
+        },
+        test_results=successful_test_results(),
+        verifier_result=successful_verifier_result(),
+        patch_published=False,
+    )
+
+    with pytest.raises(EvaluationRunException) as exc_info:
+        result_from_summary(summary)
+
+    assert exc_info.value.error_code == EvaluationRunErrorCode.AGENT_TIMEOUT_RUNNING_AGENT
+
+
+def test_agent_timeout_without_patch_classifies_as_agent_timeout(tmp_path: Path) -> None:
+    """A timed-out agent that never exported patch.diff is the agent's fault, not a validator error."""
+    summary = make_summary(
+        tmp_path,
+        exception_info={
+            "exception_type": "AgentTimeoutError",
+            "exception_message": "Agent execution timed out after 600.0 seconds",
+            "exception_traceback": "Traceback...\n_execute_agent\n",
+        },
+        patch=None,
+        eval_log="verifier output",
+        verifier_result={"rewards": {"reward": 0.0}},
+    )
+
+    with pytest.raises(EvaluationRunException) as exc_info:
+        result_from_summary(summary)
+
+    assert exc_info.value.error_code == EvaluationRunErrorCode.AGENT_TIMEOUT_RUNNING_AGENT
+
+
+def test_agent_timeout_with_empty_patch_classifies_as_agent_timeout(tmp_path: Path) -> None:
+    """An empty patch.diff is as unscoreable as a missing one."""
+    summary = make_summary(
+        tmp_path,
+        exception_info={
+            "exception_type": "AgentTimeoutError",
+            "exception_message": "Agent execution timed out after 600.0 seconds",
+            "exception_traceback": "Traceback...\n_execute_agent\n",
+        },
+        patch="",
+        eval_log="verifier output",
+        verifier_result={"rewards": {"reward": 0.0}},
+    )
+
+    with pytest.raises(EvaluationRunException) as exc_info:
+        result_from_summary(summary)
+
+    assert exc_info.value.error_code == EvaluationRunErrorCode.AGENT_TIMEOUT_RUNNING_AGENT
+
+
+def test_agent_timeout_with_unparseable_artifacts_falls_back_to_agent_timeout(tmp_path: Path) -> None:
+    """When partial-credit scoring of a timed-out run fails, keep the agent-timeout classification."""
+    summary = make_summary(
+        tmp_path,
+        exception_info={
+            "exception_type": "AgentTimeoutError",
+            "exception_message": "Agent execution timed out after 600.0 seconds",
+            "exception_traceback": "Traceback...\n_execute_agent\n",
+        },
+        test_results={"success": True, "output": "not-a-list"},
+        eval_log="verifier output",
+        verifier_result={"rewards": {"reward": 0.0}},
+    )
+
+    with pytest.raises(EvaluationRunException) as exc_info:
+        result_from_summary(summary)
+
+    assert exc_info.value.error_code == EvaluationRunErrorCode.AGENT_TIMEOUT_RUNNING_AGENT
+
+
+def test_non_timeout_exception_with_verified_reward_still_errors(tmp_path: Path) -> None:
+    """Only agent timeouts defer to the verifier; other exceptions keep the error path."""
+    summary = make_summary(
+        tmp_path,
+        exception_info={
+            "exception_type": "MinerRuntimeError",
+            "exception_message": "Miner runtime failed",
+            "exception_traceback": "Traceback...\nridges_harbor/agents.py\n",
+        },
+        agent_execution={
+            "started_at": "2026-04-09T00:00:00Z",
+            "finished_at": "2026-04-09T00:01:00Z",
+        },
+        test_results=successful_test_results(),
+        eval_log="verifier output",
+        verifier_result=successful_verifier_result(),
+    )
+
+    with pytest.raises(EvaluationRunException):
+        result_from_summary(summary)
+
+
+def test_reward_only_success_without_test_results_returns_empty_list(tmp_path: Path) -> None:
+    summary = make_summary(tmp_path, test_results=None, verifier_result=successful_verifier_result())
+
+    result = result_from_summary(summary)
+
+    assert result.patch
+    assert result.verifier_reward == 1.0
+    assert result.test_results == []
+
+
+def test_missing_patch_artifact_maps_to_validator_internal_error(tmp_path: Path) -> None:
+    summary = make_summary(
+        tmp_path,
+        patch=None,
+        test_results=successful_test_results(),
+        verifier_result=successful_verifier_result(),
+    )
+
+    with pytest.raises(EvaluationRunException) as exc_info:
+        result_from_summary(summary)
+
+    assert exc_info.value.error_code == EvaluationRunErrorCode.VALIDATOR_INTERNAL_ERROR
+    assert "patch artifact" in exc_info.value.error_message.lower()
+
+
+def test_classified_failure_omits_empty_eval_logs_from_extra(tmp_path: Path) -> None:
+    summary = make_summary(
+        tmp_path,
+        patch=None,
+        test_results=successful_test_results(),
+        eval_log=None,
+        verifier_result=successful_verifier_result(),
+    )
+
+    with pytest.raises(EvaluationRunException) as exc_info:
+        result_from_summary(summary)
+
+    assert exc_info.value.error_code == EvaluationRunErrorCode.VALIDATOR_INTERNAL_ERROR
+    assert "agent_logs" in exc_info.value.extra
+    assert "eval_logs" not in exc_info.value.extra
+    assert exc_info.value.extra["job_dir"] == summary.job_dir
+
+
+def test_artifact_test_results_fallback_is_used(tmp_path: Path) -> None:
+    summary = make_summary(
+        tmp_path,
+        test_results=None,
+        artifact_test_results=successful_test_results(),
+        verifier_result=successful_verifier_result(),
+    )
+
+    result = result_from_summary(summary)
+
+    assert len(result.test_results) == 1
+    assert result.test_results[0].name == "status updated"
+
+
+def test_artifact_report_fallback_is_used(tmp_path: Path) -> None:
+    summary = make_summary(
+        tmp_path,
+        test_results=None,
+        report_payload=None,
+        artifact_report_payload=successful_report_payload(),
+        verifier_result=successful_verifier_result(),
+    )
+
+    result = result_from_summary(summary)
+
+    assert len(result.test_results) == 2
+    assert {test.name for test in result.test_results} == {"status updated", "regression check"}
+
+
+def test_trial_log_is_appended_to_agent_logs(tmp_path: Path) -> None:
+    summary = make_summary(
+        tmp_path,
+        test_results=successful_test_results(),
+        trial_log="harbor trial log",
+        verifier_result=successful_verifier_result(),
+    )
+
+    result = result_from_summary(summary)
+
+    assert "# trial.log\nharbor trial log" in result.agent_logs
+    assert result.agent_logs.index("# trial.log\nharbor trial log") > result.agent_logs.index(
+        f"# {PATCH_APPLY_LOG_FILENAME}"
+    )
+
+
+def test_exception_file_is_appended_to_agent_logs(tmp_path: Path) -> None:
+    summary = make_summary(
+        tmp_path,
+        test_results=successful_test_results(),
+        trial_exception_text="harbor exception traceback",
+        verifier_result=successful_verifier_result(),
+    )
+
+    result = result_from_summary(summary)
+
+    assert "# exception.txt\nharbor exception traceback" in result.agent_logs
+    assert result.agent_logs.index("# exception.txt\nharbor exception traceback") > result.agent_logs.index(
+        f"# {PATCH_APPLY_LOG_FILENAME}"
+    )
+
+
+def test_non_object_verifier_payload_maps_to_validator_internal_error(tmp_path: Path) -> None:
+    summary = make_summary(
+        tmp_path,
+        patch="valid patch",
+        test_results=None,
+        verifier_result=successful_verifier_result(),
+    )
+    write(summary.trial_dir / "verifier" / "test_results.json", "[]")
+
+    with pytest.raises(EvaluationRunException) as exc_info:
+        result_from_summary(summary)
+
+    assert exc_info.value.error_code == EvaluationRunErrorCode.VALIDATOR_INTERNAL_ERROR
+    assert "valid dictionary" in exc_info.value.error_message
+
+
+def test_non_list_verifier_output_maps_to_validator_internal_error(tmp_path: Path) -> None:
+    summary = make_summary(
+        tmp_path,
+        patch="valid patch",
+        verifier_result=successful_verifier_result(),
+        test_results={
+            "success": True,
+            "output": {"name": "status updated"},
+        },
+    )
+
+    with pytest.raises(EvaluationRunException) as exc_info:
+        result_from_summary(summary)
+
+    assert exc_info.value.error_code == EvaluationRunErrorCode.VALIDATOR_INTERNAL_ERROR
+    assert "output" in exc_info.value.error_message
+    assert "valid list" in exc_info.value.error_message
+
+
+def test_non_boolean_verifier_success_maps_to_validator_internal_error(tmp_path: Path) -> None:
+    summary = make_summary(
+        tmp_path,
+        patch="valid patch",
+        verifier_result=successful_verifier_result(),
+        test_results={"success": []},
+    )
+
+    with pytest.raises(EvaluationRunException) as exc_info:
+        result_from_summary(summary)
+
+    assert exc_info.value.error_code == EvaluationRunErrorCode.VALIDATOR_INTERNAL_ERROR
+    assert "success" in exc_info.value.error_message
+    assert "valid boolean" in exc_info.value.error_message
+
+
+def test_non_string_verifier_error_maps_to_validator_internal_error(tmp_path: Path) -> None:
+    summary = make_summary(
+        tmp_path,
+        patch="valid patch",
+        verifier_result=successful_verifier_result(),
+        test_results={"success": False, "error": []},
+    )
+
+    with pytest.raises(EvaluationRunException) as exc_info:
+        result_from_summary(summary)
+
+    assert exc_info.value.error_code == EvaluationRunErrorCode.VALIDATOR_INTERNAL_ERROR
+    assert "error" in exc_info.value.error_message
+    assert "valid string" in exc_info.value.error_message
+
+
+def test_invalid_verifier_output_item_maps_to_validator_internal_error(tmp_path: Path) -> None:
+    summary = make_summary(
+        tmp_path,
+        patch="valid patch",
+        verifier_result=successful_verifier_result(),
+        test_results={"success": True, "output": [{"name": "status updated"}]},
+    )
+
+    with pytest.raises(EvaluationRunException) as exc_info:
+        result_from_summary(summary)
+
+    assert exc_info.value.error_code == EvaluationRunErrorCode.VALIDATOR_INTERNAL_ERROR
+    assert "output.0.category" in exc_info.value.error_message
+    assert "Field required" in exc_info.value.error_message
+
+
+def test_multi_metric_reward_payload_maps_to_validator_internal_error(tmp_path: Path) -> None:
+    summary = make_summary(
+        tmp_path,
+        verifier_result={"rewards": {"score": 1.0, "secondary": 0.5}},
+    )
+
+    with pytest.raises(EvaluationRunException) as exc_info:
+        result_from_summary(summary)
+
+    assert exc_info.value.error_code == EvaluationRunErrorCode.VALIDATOR_INTERNAL_ERROR
+    assert "multi-metric reward payload" in exc_info.value.error_message
+
+
+def test_reward_key_is_preferred_even_if_other_metrics_are_present(tmp_path: Path) -> None:
+    summary = make_summary(
+        tmp_path,
+        verifier_result={"rewards": {"reward": 1.0, "secondary": 0.5}},
+    )
+
+    result = result_from_summary(summary)
+
+    assert result.patch
+    assert result.verifier_reward == 1.0
+    assert result.test_results == []
+
+
+def test_single_nonstandard_reward_metric_is_accepted(tmp_path: Path) -> None:
+    summary = make_summary(
+        tmp_path,
+        verifier_result={"rewards": {"score": 1.0}},
+    )
+
+    result = result_from_summary(summary)
+
+    assert result.patch
+    assert result.verifier_reward == 1.0
+    assert result.test_results == []
+
+
+def test_empty_reward_payload_maps_to_validator_internal_error(tmp_path: Path) -> None:
+    summary = make_summary(
+        tmp_path,
+        verifier_result={"rewards": {}},
+    )
+
+    with pytest.raises(EvaluationRunException) as exc_info:
+        result_from_summary(summary)
+
+    assert exc_info.value.error_code == EvaluationRunErrorCode.VALIDATOR_INTERNAL_ERROR
+    assert "usable reward payload" in exc_info.value.error_message
+
+
+def test_best_effort_verifier_report_is_appended_to_eval_logs(tmp_path: Path) -> None:
+    summary = make_summary(
+        tmp_path,
+        eval_log="verifier output",
+        verifier_result=successful_verifier_result(),
+    )
+    write_json(
+        summary.trial_dir / "verifier" / "report.json",
+        {"suite": "swebench", "passed": ["case_a"], "failed": []},
+    )
+
+    result = result_from_summary(summary)
+
+    assert "verifier output" in result.eval_logs
+    assert "discovered_verifier_report" in result.eval_logs
+    assert "verifier/report.json" in result.eval_logs
+    assert '"suite": "swebench"' in result.eval_logs
+
+
+def test_junit_xml_fills_test_results_when_json_artifacts_are_missing(tmp_path: Path) -> None:
+    summary = make_summary(tmp_path, test_results=None, verifier_result={"rewards": {"reward": 0.0}})
+    write(
+        summary.trial_dir / "verifier" / "junit.xml",
+        """<testsuites><testsuite name="pytest">
+            <testcase classname="tests.test_store" name="test_reload" />
+            <testcase classname="tests.test_store" name="test_contract"><failure message="assert" /></testcase>
+            <testcase classname="tests.test_store" name="test_boom"><error message="crash" /></testcase>
+            <testcase classname="tests.test_store" name="test_later"><skipped message="not yet" /></testcase>
+        </testsuite></testsuites>""",
+    )
+
+    result = result_from_summary(summary)
+
+    assert [(test.name, test.status.value) for test in result.test_results] == [
+        ("tests.test_store::test_reload", "pass"),
+        ("tests.test_store::test_contract", "fail"),
+        ("tests.test_store::test_boom", "fail"),
+        ("tests.test_store::test_later", "skip"),
+    ]
+    assert {test.category.value for test in result.test_results} == {"default"}
+
+
+def test_junit_xml_with_zero_testcases_returns_empty_results(tmp_path: Path) -> None:
+    summary = make_summary(tmp_path, test_results=None, verifier_result={"rewards": {"reward": 0.0}})
+    write(
+        summary.trial_dir / "verifier" / "junit.xml",
+        '<testsuites><testsuite name="pytest" errors="1" tests="0" /></testsuites>',
+    )
+
+    result = result_from_summary(summary)
+
+    assert result.test_results == []
+
+
+def test_malformed_junit_xml_returns_empty_results(tmp_path: Path) -> None:
+    summary = make_summary(tmp_path, test_results=None, verifier_result={"rewards": {"reward": 0.0}})
+    write(summary.trial_dir / "verifier" / "junit.xml", "<testsuites><testsuite")
+
+    result = result_from_summary(summary)
+
+    assert result.test_results == []
+
+
+def test_test_results_json_takes_precedence_over_junit_xml(tmp_path: Path) -> None:
+    summary = make_summary(
+        tmp_path,
+        test_results=successful_test_results(),
+        verifier_result=successful_verifier_result(),
+    )
+    write(
+        summary.trial_dir / "verifier" / "junit.xml",
+        '<testsuite><testcase classname="tests" name="test_from_junit" /></testsuite>',
+    )
+
+    result = result_from_summary(summary)
+
+    assert [test.name for test in result.test_results] == ["status updated"]
+
+
+def test_nested_junit_xml_under_verifier_dir_is_discovered(tmp_path: Path) -> None:
+    summary = make_summary(tmp_path, test_results=None, verifier_result=successful_verifier_result())
+    write(
+        summary.trial_dir / "verifier" / "logs" / "verifier" / "junit.xml",
+        '<testsuite><testcase classname="tests" name="test_nested" /></testsuite>',
+    )
+
+    result = result_from_summary(summary)
+
+    assert [(test.name, test.status.value) for test in result.test_results] == [("tests::test_nested", "pass")]
+
+
+def test_pytest_xml_is_accepted_as_junit_fallback(tmp_path: Path) -> None:
+    summary = make_summary(tmp_path, test_results=None, verifier_result=successful_verifier_result())
+    write(
+        summary.trial_dir / "artifacts" / "pytest.xml",
+        '<testsuite><testcase name="test_bare_name" /></testsuite>',
+    )
+
+    result = result_from_summary(summary)
+
+    assert [(test.name, test.status.value) for test in result.test_results] == [("test_bare_name", "pass")]
+
+
+def test_missing_verifier_result_maps_to_validator_internal_error(tmp_path: Path) -> None:
+    summary = make_summary(tmp_path, verifier_result=None)
+
+    with pytest.raises(EvaluationRunException) as exc_info:
+        result_from_summary(summary)
+
+    assert exc_info.value.error_code == EvaluationRunErrorCode.VALIDATOR_INTERNAL_ERROR
+    assert "without a verifier result" in exc_info.value.error_message

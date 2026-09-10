@@ -1,0 +1,85 @@
+from datetime import datetime
+from typing import Optional
+from uuid import UUID
+
+import sqlalchemy as sa
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+from sqlalchemy.orm import Mapped, mapped_column
+
+from db.base import Base, CreatedAtMixin
+from db.models.enums import EvaluationSetGroup
+
+
+class Evaluation(Base, CreatedAtMixin):
+    __tablename__ = "evaluations"
+
+    evaluation_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
+    agent_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), sa.ForeignKey("agents.agent_id"), nullable=False)
+    validator_hotkey: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    set_id: Mapped[int] = mapped_column(sa.Integer, nullable=False)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(sa.TIMESTAMP(timezone=True))
+    evaluation_set_group: Mapped[EvaluationSetGroup] = mapped_column(
+        sa.Enum(EvaluationSetGroup, name="evaluationsetgroup"), nullable=False
+    )
+
+    __table_args__ = (
+        sa.ForeignKeyConstraint(
+            ["agent_id", "set_id"],
+            ["agents.agent_id", "agents.set_id"],
+            name="fk_evaluations_agent_competition",
+        ),
+        sa.Index("idx_evaluations_id", "evaluation_id"),
+        sa.Index("idx_evaluations_agent_id", "agent_id"),
+        sa.Index(
+            "idx_evaluations_set_group_agent_id",
+            "evaluation_set_group",
+            "agent_id",
+        ),
+        sa.Index(
+            "idx_evaluations_validator_pattern",
+            "validator_hotkey",
+            postgresql_ops={"validator_hotkey": "text_pattern_ops"},
+        ),
+        sa.Index("idx_evaluations_set_id", "set_id"),
+    )
+
+
+class ApprovedAgent(Base):
+    __tablename__ = "approved_agents"
+
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        primary_key=True,
+        server_default=sa.text("gen_random_uuid()"),
+    )
+    agent_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), sa.ForeignKey("agents.agent_id"))
+    set_id: Mapped[int] = mapped_column(sa.Integer, nullable=False)
+    approved_at: Mapped[datetime] = mapped_column(
+        sa.TIMESTAMP(timezone=True),
+        nullable=False,
+        server_default=sa.text("NOW()"),
+    )
+    baseline_agent_id: Mapped[Optional[UUID]] = mapped_column(
+        PG_UUID(as_uuid=True),
+        sa.ForeignKey("agents.agent_id", ondelete="SET NULL"),
+    )
+    performance_delta: Mapped[Optional[float]] = mapped_column(sa.Float)
+    cost_delta: Mapped[Optional[float]] = mapped_column(sa.Float)
+    relative_improvement_units: Mapped[Optional[float]] = mapped_column(sa.Float)
+    time_multiplier: Mapped[Optional[float]] = mapped_column(sa.Float)
+    initial_reward_score: Mapped[Optional[float]] = mapped_column(sa.Float)
+
+    __table_args__ = (
+        sa.UniqueConstraint("agent_id", "set_id"),
+        sa.ForeignKeyConstraint(
+            ["agent_id", "set_id"],
+            ["agents.agent_id", "agents.set_id"],
+            name="fk_approved_agents_agent_competition",
+        ),
+        sa.ForeignKeyConstraint(
+            ["baseline_agent_id", "set_id"],
+            ["agents.agent_id", "agents.set_id"],
+            name="fk_approved_agents_baseline_competition",
+        ),
+        sa.Index("idx_approved_agents_set_approved_at", "set_id", approved_at.desc()),
+    )

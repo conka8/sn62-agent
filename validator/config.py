@@ -1,0 +1,283 @@
+import logging
+import os
+import re
+
+from bittensor_wallet.wallet import Wallet
+from dotenv import load_dotenv
+
+from utils.docker import get_prune_timeout_seconds
+from utils.logger import setup_logging
+from utils.validator_hotkeys import validator_hotkey_to_name
+
+setup_logging()
+logger = logging.getLogger(__name__)
+
+
+load_dotenv()
+
+
+NETUID = os.getenv("NETUID")
+if not NETUID:
+    logger.fatal("NETUID is not set in .env")
+NETUID = int(NETUID)
+
+SUBTENSOR_ADDRESS = os.getenv("SUBTENSOR_ADDRESS")
+if not SUBTENSOR_ADDRESS:
+    logger.fatal("SUBTENSOR_ADDRESS is not set in .env")
+
+SUBTENSOR_NETWORK = os.getenv("SUBTENSOR_NETWORK")
+if not SUBTENSOR_NETWORK:
+    logger.fatal("SUBTENSOR_NETWORK is not set in .env")
+
+
+MODE = os.getenv("MODE")
+if not MODE:
+    logger.fatal("MODE is not set in .env")
+
+if MODE != "screener" and MODE != "validator":
+    logger.fatal("MODE must be either 'screener' or 'validator'")
+
+
+if MODE == "validator":
+    VALIDATOR_WALLET_NAME = os.getenv("VALIDATOR_WALLET_NAME")
+    if not VALIDATOR_WALLET_NAME:
+        logger.fatal("VALIDATOR_WALLET_NAME is not set in .env")
+
+    VALIDATOR_HOTKEY_NAME = os.getenv("VALIDATOR_HOTKEY_NAME")
+    if not VALIDATOR_HOTKEY_NAME:
+        logger.fatal("VALIDATOR_HOTKEY_NAME is not set in .env")
+
+    try:
+        VALIDATOR_WALLET = Wallet(name=VALIDATOR_WALLET_NAME, hotkey=VALIDATOR_HOTKEY_NAME)
+        VALIDATOR_HOTKEY = VALIDATOR_WALLET.hotkey
+    except Exception as e:
+        logger.fatal(f"Error loading hotkey: {e}")
+
+
+elif MODE == "screener":
+    SCREENER_NAME = os.getenv("SCREENER_NAME")
+    if not SCREENER_NAME:
+        logger.fatal("SCREENER_NAME is not set in .env")
+
+    if not re.match(r"screener-\d-\d+", SCREENER_NAME):
+        logger.fatal("SCREENER_NAME must be in the format screener-CLASS-NUM")
+
+    screener_class = SCREENER_NAME.split("-")[1]
+    if screener_class != "1" and screener_class != "2":
+        logger.fatal("SCREENER_NAME must be in the format screener-CLASS-NUM where CLASS is 1 or 2")
+
+    SCREENER_PASSWORD = os.getenv("SCREENER_PASSWORD")
+    if not SCREENER_PASSWORD:
+        logger.fatal("SCREENER_PASSWORD is not set in .env")
+
+
+RIDGES_PLATFORM_URL = os.getenv("RIDGES_PLATFORM_URL")
+if not RIDGES_PLATFORM_URL:
+    logger.fatal("RIDGES_PLATFORM_URL is not set in .env")
+
+RIDGES_PLATFORM_URL = RIDGES_PLATFORM_URL.rstrip("/")
+SCREENER_EDGE_KEY = os.getenv("SCREENER_EDGE_KEY")
+
+SEND_HEARTBEAT_INTERVAL_SECONDS = os.getenv("SEND_HEARTBEAT_INTERVAL_SECONDS")
+if not SEND_HEARTBEAT_INTERVAL_SECONDS:
+    logger.fatal("SEND_HEARTBEAT_INTERVAL_SECONDS is not set in .env")
+SEND_HEARTBEAT_INTERVAL_SECONDS = max(int(SEND_HEARTBEAT_INTERVAL_SECONDS), 10)  # minimum 10 seconds
+
+VALIDATOR_CANCELLATION_CHECK_INTERVAL_SECONDS = max(
+    int(os.getenv("VALIDATOR_CANCELLATION_CHECK_INTERVAL_SECONDS", "15")),
+    15,
+)
+
+SET_WEIGHTS_INTERVAL_SECONDS = os.getenv("SET_WEIGHTS_INTERVAL_SECONDS")
+if not SET_WEIGHTS_INTERVAL_SECONDS:
+    logger.fatal("SET_WEIGHTS_INTERVAL_SECONDS is not set in .env")
+SET_WEIGHTS_INTERVAL_SECONDS = int(SET_WEIGHTS_INTERVAL_SECONDS)
+
+SET_WEIGHTS_TIMEOUT_SECONDS = os.getenv("SET_WEIGHTS_TIMEOUT_SECONDS", "90")  # TODO ADAM
+if not SET_WEIGHTS_TIMEOUT_SECONDS:
+    logger.fatal("SET_WEIGHTS_TIMEOUT_SECONDS is not set in .env")
+SET_WEIGHTS_TIMEOUT_SECONDS = int(SET_WEIGHTS_TIMEOUT_SECONDS)
+
+REQUEST_EVALUATION_INTERVAL_SECONDS = os.getenv("REQUEST_EVALUATION_INTERVAL_SECONDS")
+if not REQUEST_EVALUATION_INTERVAL_SECONDS:
+    logger.fatal("REQUEST_EVALUATION_INTERVAL_SECONDS is not set in .env")
+REQUEST_EVALUATION_INTERVAL_SECONDS = 60
+
+MAX_HEARTBEAT_FAILURES: int = int(os.getenv("MAX_HEARTBEAT_FAILURES", "5"))
+
+
+SIMULATE_EVALUATION_RUNS = os.getenv("SIMULATE_EVALUATION_RUNS")
+if not SIMULATE_EVALUATION_RUNS:
+    logger.fatal("SIMULATE_EVALUATION_RUNS is not set in .env")
+SIMULATE_EVALUATION_RUNS = SIMULATE_EVALUATION_RUNS.lower() == "true"
+
+SIMULATE_EVALUATION_RUN_MAX_TIME_PER_STAGE_SECONDS = os.getenv("SIMULATE_EVALUATION_RUN_MAX_TIME_PER_STAGE_SECONDS")
+if not SIMULATE_EVALUATION_RUN_MAX_TIME_PER_STAGE_SECONDS:
+    logger.fatal("SIMULATE_EVALUATION_RUN_MAX_TIME_PER_STAGE_SECONDS is not set in .env")
+SIMULATE_EVALUATION_RUN_MAX_TIME_PER_STAGE_SECONDS = int(SIMULATE_EVALUATION_RUN_MAX_TIME_PER_STAGE_SECONDS)
+
+INCLUDE_SOLUTIONS = os.getenv("INCLUDE_SOLUTIONS")
+if not INCLUDE_SOLUTIONS:
+    logger.fatal("INCLUDE_SOLUTIONS is not set in .env")
+INCLUDE_SOLUTIONS = INCLUDE_SOLUTIONS.lower() == "true"
+
+
+UPDATE_AUTOMATICALLY = os.getenv("UPDATE_AUTOMATICALLY")
+if not UPDATE_AUTOMATICALLY:
+    logger.fatal("UPDATE_AUTOMATICALLY is not set in .env")
+UPDATE_AUTOMATICALLY = UPDATE_AUTOMATICALLY.lower() == "true"
+
+
+logger.info("=== Validator Configuration ===")
+
+logger.info(f"Network ID: {NETUID}")
+logger.info(f"Subtensor Address: {SUBTENSOR_ADDRESS}")
+logger.info(f"Subtensor Network: {SUBTENSOR_NETWORK}")
+logger.info("-------------------------------")
+
+logger.info(f"Mode: {MODE}")
+if MODE == "validator":
+    logger.info(f"Validator Wallet Name: {VALIDATOR_WALLET_NAME}")
+    logger.info(f"Validator Hotkey Name: {VALIDATOR_HOTKEY_NAME}")
+    logger.info(f"Validator Hotkey: {VALIDATOR_HOTKEY.ss58_address}")
+elif MODE == "screener":
+    logger.info(f"Screener Name: {SCREENER_NAME}")
+logger.info("-------------------------------")
+
+logger.info(f"Ridges Platform URL: {RIDGES_PLATFORM_URL}")
+logger.info("-------------------------------")
+
+logger.info(f"Send Heartbeat Interval: {SEND_HEARTBEAT_INTERVAL_SECONDS} second(s)")
+logger.info(f"Validator Cancellation Check Interval: {VALIDATOR_CANCELLATION_CHECK_INTERVAL_SECONDS} second(s)")
+logger.info(f"Set Weights Interval: {SET_WEIGHTS_INTERVAL_SECONDS} second(s)")
+logger.info(f"Set Weights Timeout: {SET_WEIGHTS_TIMEOUT_SECONDS} second(s)")
+logger.info(f"Request Evaluation Interval: {REQUEST_EVALUATION_INTERVAL_SECONDS} second(s)")
+logger.info("-------------------------------")
+
+if SIMULATE_EVALUATION_RUNS:
+    logger.warning("Simulating Evaluation Runs!")
+else:
+    if INCLUDE_SOLUTIONS:
+        logger.warning("Including Solutions!")
+    else:
+        logger.info("Not Including Solutions")
+logger.info("-------------------------------")
+
+if UPDATE_AUTOMATICALLY:
+    logger.info("Updating Automatically")
+else:
+    logger.warning("Not Updating Automatically!")
+
+VALIDATOR_MAX_CONCURRENT_EVALUATION_RUNS = 15
+SCREENER_DEFAULT_MAX_CONCURRENT_EVALUATION_RUNS = 10
+HARDCODED_MAX_COST_USD = 0.29
+VALIDATOR_CONCURRENCY_CAPS_BY_NAME = {
+    "Kraken": 10,
+    "WildSage Labs (RT21)": 10,
+    "Rizzo": 10,
+    # "Opentensor Foundation": 10,
+    # "Yuma": 10,
+}
+
+MAX_CONCURRENT_EVALUATION_RUNS = os.getenv("MAX_CONCURRENT_EVALUATION_RUNS")
+if MODE == "validator":
+    validator_name = validator_hotkey_to_name(VALIDATOR_HOTKEY.ss58_address)
+    validator_concurrency_cap = min(
+        VALIDATOR_CONCURRENCY_CAPS_BY_NAME.get(validator_name, VALIDATOR_MAX_CONCURRENT_EVALUATION_RUNS),
+        VALIDATOR_MAX_CONCURRENT_EVALUATION_RUNS,
+    )
+    if MAX_CONCURRENT_EVALUATION_RUNS:
+        logger.warning(
+            "Ignoring MAX_CONCURRENT_EVALUATION_RUNS in validator mode; "
+            f"using configured cap of {validator_concurrency_cap} for {validator_name}"
+        )
+    if validator_concurrency_cap != VALIDATOR_MAX_CONCURRENT_EVALUATION_RUNS:
+        logger.info(f"Applying validator-specific concurrency cap for {validator_name}: {validator_concurrency_cap}")
+    MAX_CONCURRENT_EVALUATION_RUNS = validator_concurrency_cap
+else:
+    if not MAX_CONCURRENT_EVALUATION_RUNS:
+        logger.warning("MAX_CONCURRENT_EVALUATION_RUNS is not set in .env")
+        MAX_CONCURRENT_EVALUATION_RUNS = SCREENER_DEFAULT_MAX_CONCURRENT_EVALUATION_RUNS
+    MAX_CONCURRENT_EVALUATION_RUNS = int(MAX_CONCURRENT_EVALUATION_RUNS)
+logger.info(f"Max Concurrent Evaluation Runs: {MAX_CONCURRENT_EVALUATION_RUNS}")
+
+RIDGES_HARBOR_RESULTS_DIR = os.getenv("RIDGES_HARBOR_RESULTS_DIR")
+RIDGES_HARBOR_DEBUG = os.getenv("RIDGES_HARBOR_DEBUG", "false").lower() == "true"
+RIDGES_MAX_COST_USD = HARDCODED_MAX_COST_USD
+
+# Local-storage cleanup: a low-priority background loop prunes the task cache and
+# Harbor job artifacts by age. Deliberately non-aggressive; safe to disable.
+CLEANUP_ENABLED = os.getenv("CLEANUP_ENABLED", "true").lower() == "true"
+CLEANUP_INTERVAL_SECONDS = int(os.getenv("CLEANUP_INTERVAL_SECONDS", "3600"))
+CLEANUP_ARTIFACT_RETENTION_HOURS = int(os.getenv("CLEANUP_ARTIFACT_RETENTION_HOURS", "48"))
+CLEANUP_TASK_CACHE_RETENTION_HOURS = int(os.getenv("CLEANUP_TASK_CACHE_RETENTION_HOURS", "168"))
+logger.info(f"Cleanup Enabled: {CLEANUP_ENABLED}")
+if CLEANUP_ENABLED:
+    logger.info(f"Cleanup Interval: {CLEANUP_INTERVAL_SECONDS} second(s)")
+    logger.info(f"Cleanup Artifact Retention: {CLEANUP_ARTIFACT_RETENTION_HOURS} hour(s)")
+    logger.info(f"Cleanup Task Cache Retention: {CLEANUP_TASK_CACHE_RETENTION_HOURS} hour(s)")
+
+CLEANUP_DOCKER_ENABLED = os.getenv("CLEANUP_DOCKER_ENABLED", "true").lower() == "true"
+CLEANUP_DOCKER_DRY_RUN = os.getenv("CLEANUP_DOCKER_DRY_RUN", "false").lower() == "true"
+
+CLEANUP_STOPPED_GRACE_MINUTES = max(5, int(os.getenv("CLEANUP_STOPPED_GRACE_MINUTES", "45")))
+CLEANUP_RUNNING_TTL_HOURS = max(2, int(os.getenv("CLEANUP_RUNNING_TTL_HOURS", "4")))
+CLEANUP_IMAGE_TAG_GRACE_HOURS = max(1, int(os.getenv("CLEANUP_IMAGE_TAG_GRACE_HOURS", "6")))
+CLEANUP_PULLED_IMAGE_DISK_PERCENT = min(100, max(50, int(os.getenv("CLEANUP_PULLED_IMAGE_DISK_PERCENT", "50"))))
+CLEANUP_DISK_PRESSURE_PERCENT = min(100, max(50, int(os.getenv("CLEANUP_DISK_PRESSURE_PERCENT", "75"))))
+if CLEANUP_ENABLED and CLEANUP_DOCKER_ENABLED:
+    logger.info(f"Docker Janitor: dry_run={CLEANUP_DOCKER_DRY_RUN}")
+    logger.info(f"Docker Janitor Stopped-Container Grace: {CLEANUP_STOPPED_GRACE_MINUTES} minute(s)")
+    logger.info(f"Docker Janitor Running-Container TTL: {CLEANUP_RUNNING_TTL_HOURS} hour(s)")
+    logger.info(f"Docker Janitor Image Tag Grace: {CLEANUP_IMAGE_TAG_GRACE_HOURS} hour(s)")
+    logger.info(f"Docker Janitor Pulled-Image Threshold: {CLEANUP_PULLED_IMAGE_DISK_PERCENT}%")
+    logger.info(f"Docker Janitor Disk Pressure Threshold: {CLEANUP_DISK_PRESSURE_PERCENT}%")
+    logger.info(f"Docker Janitor Prune Timeout: {get_prune_timeout_seconds()} second(s)")
+
+# --- Environment Backend ---
+RIDGES_ENVIRONMENT_TYPE = os.getenv("RIDGES_ENVIRONMENT_TYPE", "docker")
+if RIDGES_ENVIRONMENT_TYPE not in ("docker", "kubernetes"):
+    logger.fatal("RIDGES_ENVIRONMENT_TYPE must be 'docker' or 'kubernetes'")
+
+# K8s-only config (only evaluated when RIDGES_ENVIRONMENT_TYPE=kubernetes)
+K8S_NAMESPACE: str = "ridges"
+K8S_REGISTRY: str = "registry.ridges.svc:5000"
+K8S_CONTEXT: str | None = None
+K8S_NODE_SELECTOR: dict[str, str] | None = None
+K8S_REGISTRY_SECRET: str | None = None
+K8S_REGISTRY_PASSWORD: str | None = None
+K8S_REGISTRY_INSECURE: bool = True
+K8S_BUILD_REGISTRY: str = "registry.ridges:5000"
+K8S_BUILD_REGISTRY_INSECURE: bool = True
+K8S_MEMORY_REQUEST_FRACTION: float = 0.25
+K8S_CPU_REQUEST_FRACTION: float = 0.25
+K8S_MEMORY_LIMIT_MULTIPLIER: float = 1.0
+K8S_SIDECAR_MEMORY_REQUEST_MI: int = 512
+K8S_SIDECAR_MEMORY_LIMIT_MI: int = 2048
+
+PROXY_IMAGE: str = os.getenv(
+    "PROXY_IMAGE",
+    "ghcr.io/ridgesai/sandbox-proxy:0.0.4",
+)
+
+if RIDGES_ENVIRONMENT_TYPE == "kubernetes":
+    K8S_NAMESPACE = os.getenv("K8S_NAMESPACE", "ridges")
+    K8S_REGISTRY = os.getenv("K8S_REGISTRY", "registry.ridges.svc:5000")
+    K8S_CONTEXT = os.getenv("K8S_CONTEXT")  # None = use current/in-cluster context
+    _node_selector_raw = os.getenv("K8S_NODE_SELECTOR")  # e.g. "pool=sandbox,arch=amd64"
+    if _node_selector_raw:
+        K8S_NODE_SELECTOR = dict(kv.split("=", 1) for kv in _node_selector_raw.split(","))
+    K8S_REGISTRY_SECRET = os.getenv("K8S_REGISTRY_SECRET")  # e.g. "registry-creds"
+    K8S_REGISTRY_PASSWORD = os.getenv("K8S_REGISTRY_PASSWORD")  # for HEAD check Basic Auth
+    K8S_REGISTRY_INSECURE = os.getenv("K8S_REGISTRY_INSECURE", "true").lower() == "true"
+    K8S_BUILD_REGISTRY = os.getenv("K8S_BUILD_REGISTRY", f"registry.{K8S_NAMESPACE}:5000")
+    K8S_BUILD_REGISTRY_INSECURE = os.getenv("K8S_BUILD_REGISTRY_INSECURE", "true").lower() == "true"
+    K8S_MEMORY_REQUEST_FRACTION: float = float(os.getenv("K8S_MEMORY_REQUEST_FRACTION", "0.25"))
+    K8S_CPU_REQUEST_FRACTION: float = float(os.getenv("K8S_CPU_REQUEST_FRACTION", "0.25"))
+    K8S_MEMORY_LIMIT_MULTIPLIER: float = float(os.getenv("K8S_MEMORY_LIMIT_MULTIPLIER", "1.0"))
+    K8S_SIDECAR_MEMORY_REQUEST_MI: int = int(os.getenv("K8S_SIDECAR_MEMORY_REQUEST_MI", "512"))
+    K8S_SIDECAR_MEMORY_LIMIT_MI: int = int(os.getenv("K8S_SIDECAR_MEMORY_LIMIT_MI", "2048"))
+
+logger.info(f"Execution Backend: {RIDGES_ENVIRONMENT_TYPE}")
+
+logger.info("===============================")

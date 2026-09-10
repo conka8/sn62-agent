@@ -1,0 +1,990 @@
+# NOTE ADAM: Subtensor bug (self.disable_third_party_loggers())
+import asyncio
+import concurrent.futures
+import logging
+import os
+import pathlib
+import random
+import signal
+import sys
+import time
+import traceback
+from typing import Any, Dict
+from uuid import UUID
+
+import httpx
+
+import validator.config as config
+from api.endpoints.validator_models import (
+    ScreenerRegistrationRequest,
+    ScreenerRegistrationResponse,
+    ValidatorCancelCurrentEvaluationRequest,
+    ValidatorCheckCancellationRequest,
+    ValidatorCheckCancellationResponse,
+    ValidatorDisconnectRequest,
+    ValidatorFinishEvaluationRequest,
+    ValidatorRegistrationRequest,
+    ValidatorRegistrationResponse,
+    ValidatorRequestEvaluationRequest,
+    ValidatorRequestEvaluationResponse,
+    ValidatorTaskDownloadUrlRequest,
+    ValidatorUpdateEvaluationRunRequest,
+    ValidatorUpdateEvaluationRunResponse,
+)
+from execution.artifacts import _read_proxy_cost
+from execution.engine import ExecutionEngine
+from execution.errors import EvaluationRunException
+from execution.types import TrialSnapshot
+from models.evaluation_run import EvaluationRunErrorCode, EvaluationRunStatus
+from models.openrouter import OpenRouterRuntimeConfig
+from models.problem import ProblemTestResultStatus
+from utils.docker import cleanup_harbor_docker_resources, prune_docker_disk_resources
+from utils.git import COMMIT_HASH, reset_local_repo
+from utils.logger import setup_logging
+from utils.system_metrics import get_system_metrics
+from validator.background_loops import cleanup_loop, set_weights_loop
+from validator.heartbeat import start_heartbeat_thread
+from validator.http_utils import post_ridges_platform
+from validator.retry_utils import retry_with_backoff
+
+logger = logging.getLogger("validator")
+
+# The session ID for this validator
+session_id = None
+running_agent_timeout_seconds = None
+running_eval_timeout_seconds = None
+max_evaluation_run_log_size_bytes = None
+environment_build_timeout_multiplier = None
+
+
+execution_engine = None
+STATUS_HOOK_TIMEOUT_SECONDS = 5
+_shutdown_requested = False
+_healthz_task: asyncio.Task | None = None
+
+# Task-cache digests of in-flight evaluation runs. The cleanup loop excludes these
+# so it never deletes a cached task a live run is still reading (a task is read for
+# the whole run and reused across days, so its mtime can be old while in use).
+_active_task_digests: set[str] = set()
+
+
+# Disconnect from the Ridges platform (called when the program exits)
+async def disconnect(reason: str):
+    if session_id is None:
+        return
+
+    try:
+        logger.info("Disconnecting validator...")
+        await post_ridges_platform(
+            "/validator/disconnect", ValidatorDisconnectRequest(reason=reason), bearer_token=session_id
+        )
+        logger.info("Disconnected validator")
+    except Exception as e:
+        logger.error(f"Error in disconnect(): {type(e).__name__}: {e}", exc_info=True)
+        os._exit(1)
+
+
+async def _handle_sigterm() -> None:
+    global _shutdown_requested
+    logger.warning("SIGTERM received — will shut down after current evaluation finishes")
+    _shutdown_requested = True
+
+
+async def _run_startup_tasks() -> None:
+    """Run environment-specific startup tasks before entering the main loop."""
+    global _healthz_task
+    if config.RIDGES_ENVIRONMENT_TYPE == "docker":
+        if config.CLEANUP_ENABLED and config.CLEANUP_DOCKER_ENABLED:
+            dry_run = config.CLEANUP_DOCKER_DRY_RUN
+            containers = {"count": 0, "names": [], "errors": 0}
+            prune = {"image_bytes": 0, "build_bytes": 0, "errors": 0}
+            disk_percent = None
+            errors = 0
+            logger.info(f"Janitor startup: starting (dry_run={str(dry_run).lower()})")
+
+            try:
+                metrics = await get_system_metrics()
+                disk_percent = metrics.disk_percent
+            except Exception as e:
+                errors += 1
+                logger.warning(f"Janitor startup metrics failed (best-effort): {type(e).__name__}: {e}")
+
+            logger.info("Janitor startup: sweeping containers...")
+            try:
+                containers = await asyncio.to_thread(
+                    cleanup_harbor_docker_resources,
+                    dry_run=dry_run,
+                    stopped_grace_sec=config.CLEANUP_STOPPED_GRACE_MINUTES * 60,
+                    running_ttl_sec=config.CLEANUP_RUNNING_TTL_HOURS * 3600,
+                )
+            except Exception as e:
+                errors += 1
+                logger.warning(f"Janitor startup container cleanup failed (best-effort): {type(e).__name__}: {e}")
+
+            include_build_cache = disk_percent is not None and disk_percent >= config.CLEANUP_DISK_PRESSURE_PERCENT
+            logger.info(
+                f"Janitor startup: pruning dangling images (until=1h, "
+                f"build_cache={str(include_build_cache).lower()})..."
+            )
+            try:
+                prune = await asyncio.to_thread(
+                    prune_docker_disk_resources,
+                    include_build_cache=include_build_cache,
+                    dry_run=dry_run,
+                    until="1h",
+                )
+            except Exception as e:
+                errors += 1
+                logger.warning(f"Janitor startup prune failed (best-effort): {type(e).__name__}: {e}")
+
+            errors += containers.get("errors", 0) + prune.get("errors", 0)
+            disk_display = f"{disk_percent:.0f}" if disk_percent is not None else "unknown"
+            names_display = ",".join((containers.get("names") or [])[:20]) or "-"
+            logger.info(
+                f"Janitor startup: containers={containers.get('count', 0)} "
+                f"prune_bytes={prune.get('image_bytes', 0)} "
+                f"build_bytes={prune.get('build_bytes', 0)} disk_percent={disk_display} "
+                f"errors={errors} dry_run={str(dry_run).lower()} names={names_display}"
+            )
+        else:
+            logger.info("Janitor startup: Docker cleanup disabled")
+    elif config.RIDGES_ENVIRONMENT_TYPE == "kubernetes":
+        import validator.healthz as healthz
+
+        _healthz_task = asyncio.create_task(healthz.serve(get_session_id=lambda: session_id))
+        from utils.k8s import cleanup_harbor_k8s_resources, set_screener_safe_to_evict
+
+        await asyncio.to_thread(cleanup_harbor_k8s_resources)
+        await asyncio.to_thread(set_screener_safe_to_evict, True)
+
+    asyncio.get_running_loop().add_signal_handler(
+        signal.SIGTERM,
+        lambda: asyncio.create_task(_handle_sigterm()),
+    )
+
+
+# Sends an update-evaluation-run request to the Ridges platform. The extra
+# parameter is for fields that are not sent in all requests, such as agent_logs
+# and eval_logs, which are only sent on some state transitions.
+async def update_evaluation_run(
+    evaluation_run_id: UUID,
+    problem_name: str,
+    updated_status: EvaluationRunStatus,
+    extra: Dict[str, Any] | None = None,
+    *,
+    timeout: int | None = None,
+) -> ValidatorUpdateEvaluationRunResponse:
+    logger.info(f"Updating evaluation run {evaluation_run_id} for problem {problem_name} to {updated_status.value}...")
+    clean_extra = {k: v for k, v in (extra or {}).items() if v is not None}
+
+    post_kwargs: dict[str, Any] = {
+        "bearer_token": session_id,
+        "quiet": 2,
+    }
+    if timeout is not None:
+        post_kwargs["timeout"] = timeout
+
+    request = ValidatorUpdateEvaluationRunRequest(
+        evaluation_run_id=evaluation_run_id, updated_status=updated_status, **clean_extra
+    )
+    response_data = await retry_with_backoff(
+        lambda: post_ridges_platform("/validator/update-evaluation-run", request, **post_kwargs),
+        max_attempts=3,
+        base_delay=2.0,
+    )
+    return ValidatorUpdateEvaluationRunResponse(**(response_data or {}))
+
+
+# Truncates a log if required
+def truncate_logs_if_required(log: str) -> str:
+    if len(log) > max_evaluation_run_log_size_bytes:
+        return (
+            f"<truncated {len(log) - max_evaluation_run_log_size_bytes} chars>\n\n"
+            + log[-max_evaluation_run_log_size_bytes:]
+        )
+    return log
+
+
+async def _fetch_task_download_url(task_digest: str) -> str:
+    """Ask the platform for a fresh presigned URL for a task archive."""
+    try:
+        resp = await post_ridges_platform(
+            "/validator/task-download-url",
+            ValidatorTaskDownloadUrlRequest(task_digest=task_digest),
+            bearer_token=session_id,
+            quiet=2,
+        )
+        url = resp.get("url") if isinstance(resp, dict) else None
+        if not url:
+            raise EvaluationRunException(
+                EvaluationRunErrorCode.PLATFORM_FAILED_PROVISIONING,
+                f"Platform returned no URL for task digest {task_digest}: {resp}",
+            )
+        return url
+    except httpx.HTTPStatusError as exc:
+        raise EvaluationRunException(
+            EvaluationRunErrorCode.PLATFORM_FAILED_PROVISIONING,
+            f"Platform failed to provide download URL for task digest {task_digest}: "
+            f"{exc.response.status_code} {exc.response.text}",
+        ) from exc
+    except Exception as exc:
+        raise EvaluationRunException(
+            EvaluationRunErrorCode.PLATFORM_FAILED_PROVISIONING,
+            f"Failed to fetch download URL for task digest {task_digest}: {type(exc).__name__}: {exc}",
+        ) from exc
+
+
+async def _upload_job_artifacts(job_dir: pathlib.Path, upload_url: str) -> None:
+    """Tar the job directory and PUT it to a presigned S3 URL. Best-effort."""
+    # TODO(cleanup): a future iteration could eagerly delete `job_dir` here once the
+    # upload succeeds, keeping the age-based cleanup_loop only as the fallback for
+    # failed/never-uploaded runs. Kept decoupled for now (fail-safe + local debugging).
+    try:
+        import io
+        import tarfile
+
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            tar.add(str(job_dir), arcname=job_dir.name)
+        buf.seek(0)
+        payload = buf.read()
+
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.put(upload_url, content=payload)
+            resp.raise_for_status()
+
+        logger.info(f"Uploaded {len(payload)} bytes of job artifacts to S3")
+    except Exception as exc:
+        logger.warning(f"Failed to upload job artifacts (best-effort): {exc}")
+
+
+async def _simulate_run_evaluation_run_with_semaphore(
+    evaluation_run_id: UUID, problem_name: str, semaphore: asyncio.Semaphore
+):
+    async with semaphore:
+        return await _simulate_run_evaluation_run(evaluation_run_id, problem_name)
+
+
+# Simulate a run of an evaluation run, useful for testing, set SIMULATE_EVALUATION_RUNS=True in .env
+async def _simulate_run_evaluation_run(evaluation_run_id: UUID, problem_name: str):
+    logger.info(f"Starting simulated evaluation run {evaluation_run_id} for problem {problem_name}...")
+
+    # Move from pending -> initializing_agent
+    await asyncio.sleep(random.random() * config.SIMULATE_EVALUATION_RUN_MAX_TIME_PER_STAGE_SECONDS)
+    await update_evaluation_run(evaluation_run_id, problem_name, EvaluationRunStatus.initializing_agent)
+
+    # Move from initializing_agent -> running_agent
+    await asyncio.sleep(random.random() * config.SIMULATE_EVALUATION_RUN_MAX_TIME_PER_STAGE_SECONDS)
+    await update_evaluation_run(evaluation_run_id, problem_name, EvaluationRunStatus.running_agent)
+
+    # Move from running_agent -> initializing_eval
+    await asyncio.sleep(random.random() * config.SIMULATE_EVALUATION_RUN_MAX_TIME_PER_STAGE_SECONDS)
+    await update_evaluation_run(
+        evaluation_run_id,
+        problem_name,
+        EvaluationRunStatus.initializing_eval,
+        {"patch": "FAKE PATCH", "agent_logs": "FAKE AGENT LOGS"},
+    )
+
+    # Move from initializing_eval -> running_eval
+    await asyncio.sleep(random.random() * config.SIMULATE_EVALUATION_RUN_MAX_TIME_PER_STAGE_SECONDS)
+    await update_evaluation_run(evaluation_run_id, problem_name, EvaluationRunStatus.running_eval)
+
+    # Move from running_eval -> finished
+    await asyncio.sleep(random.random() * config.SIMULATE_EVALUATION_RUN_MAX_TIME_PER_STAGE_SECONDS)
+    await update_evaluation_run(
+        evaluation_run_id,
+        problem_name,
+        EvaluationRunStatus.finished,
+        {
+            "test_results": [
+                {"name": "fake_test", "category": "default", "status": f"{ProblemTestResultStatus.PASS.value}"}
+            ],
+            "verifier_reward": 1.0,
+            "eval_logs": "FAKE EVAL LOGS",
+        },
+    )
+
+    logger.info(f"Finished simulated evaluation run {evaluation_run_id} for problem {problem_name}")
+
+
+async def _run_evaluation_run_with_semaphore(
+    evaluation_run,
+    agent_code: str,
+    semaphore: asyncio.Semaphore,
+    artifact_upload_url: str | None = None,
+    openrouter_config: OpenRouterRuntimeConfig | None = None,
+):
+    async with semaphore:
+        return await _run_evaluation_run(
+            evaluation_run,
+            agent_code,
+            artifact_upload_url=artifact_upload_url,
+            openrouter_config=openrouter_config,
+        )
+
+
+async def _run_single_attempt(
+    evaluation_run,
+    agent_code: str,
+    attempt_number: int,
+    artifact_upload_url: str | None,
+    openrouter_config: OpenRouterRuntimeConfig | None,
+) -> ValidatorUpdateEvaluationRunResponse:
+    """Run one attempt of an evaluation run and report its terminal status.
+
+    Returns the platform's response to the terminal update; response.retry
+    signals that a fresh attempt should be started.
+    """
+    global execution_engine
+    assert execution_engine is not None
+
+    evaluation_run_id = evaluation_run.evaluation_run_id
+    problem_name = evaluation_run.problem_name
+    job_dir = None
+    terminal_response = ValidatorUpdateEvaluationRunResponse()
+
+    try:
+        # Move from pending -> initializing_agent
+        await update_evaluation_run(evaluation_run_id, problem_name, EvaluationRunStatus.initializing_agent)
+
+        async def _on_agent_started() -> None:
+            await update_evaluation_run(
+                evaluation_run_id,
+                problem_name,
+                EvaluationRunStatus.running_agent,
+                timeout=STATUS_HOOK_TIMEOUT_SECONDS,
+            )
+
+        async def _on_verification_started(snapshot: TrialSnapshot) -> None:
+            await update_evaluation_run(
+                evaluation_run_id,
+                problem_name,
+                EvaluationRunStatus.initializing_eval,
+                {
+                    "patch": snapshot.patch,
+                    "agent_logs": truncate_logs_if_required(snapshot.agent_logs),
+                },
+                timeout=STATUS_HOOK_TIMEOUT_SECONDS,
+            )
+
+            await update_evaluation_run(
+                evaluation_run_id,
+                problem_name,
+                EvaluationRunStatus.running_eval,
+                timeout=STATUS_HOOK_TIMEOUT_SECONDS,
+            )
+
+        result = await execution_engine.evaluate(
+            evaluation_run_id=evaluation_run_id,
+            problem_name=problem_name,
+            execution_spec=evaluation_run.execution_spec,
+            agent_path=None,
+            agent_code=agent_code,
+            openrouter_config=openrouter_config,
+            fetch_task_url=_fetch_task_download_url,
+            on_agent_started=_on_agent_started,
+            on_verification_started=_on_verification_started,
+            attempt_number=attempt_number,
+        )
+        job_dir = result.job_dir
+
+        logger.info(
+            f"Finished {result.backend} execution for problem {problem_name}: "
+            f"{len(result.patch.splitlines())} lines of patch, "
+            f"{len(result.agent_logs.splitlines())} lines of agent logs, "
+            f"{len(result.eval_logs.splitlines())} lines of eval logs"
+        )
+
+        num_passed = sum(1 for test in result.test_results if test.status == ProblemTestResultStatus.PASS)
+        num_failed = sum(1 for test in result.test_results if test.status == ProblemTestResultStatus.FAIL)
+        num_skipped = sum(1 for test in result.test_results if test.status == ProblemTestResultStatus.SKIP)
+        logger.info(
+            f"Finished running evaluation for problem {problem_name}: "
+            f"reward={result.verifier_reward}, {len(result.test_results)} test results "
+            f"({num_passed} passed, {num_failed} failed, {num_skipped} skipped), "
+            f"{len(result.eval_logs.splitlines())} lines of eval logs"
+        )
+
+        # Move from running_eval -> finished
+        terminal_response = await update_evaluation_run(
+            evaluation_run_id,
+            problem_name,
+            EvaluationRunStatus.finished,
+            {
+                "patch": result.patch,
+                "agent_logs": truncate_logs_if_required(result.agent_logs),
+                "verifier_reward": result.verifier_reward,
+                "test_results": [
+                    test.model_dump(exclude={"test_alias"}, exclude_none=True) for test in result.test_results
+                ],
+                "eval_logs": truncate_logs_if_required(result.eval_logs),
+                "cost_usd": result.cost_usd,
+            },
+        )
+
+    except EvaluationRunException as e:
+        logger.error(f"Evaluation run {evaluation_run_id} for problem {problem_name} errored: {e}")
+        extra = dict(e.extra or {})
+        job_dir = extra.pop("job_dir", None)
+        for key in ("agent_logs", "eval_logs"):
+            if key in extra:
+                extra[key] = truncate_logs_if_required(extra[key])
+
+        cost_usd = _read_proxy_cost(job_dir) if job_dir else None
+
+        terminal_response = await update_evaluation_run(
+            evaluation_run_id,
+            problem_name,
+            EvaluationRunStatus.error,
+            {
+                "error_code": e.error_code.value,
+                "error_message": e.error_message,
+                "cost_usd": cost_usd,
+                **extra,
+            },
+        )
+
+    except Exception as e:
+        logger.error(
+            f"Evaluation run {evaluation_run_id} for problem {problem_name} errored: {EvaluationRunErrorCode.VALIDATOR_INTERNAL_ERROR.get_error_message()}: {e}",
+            exc_info=True,
+        )
+
+        terminal_response = await update_evaluation_run(
+            evaluation_run_id,
+            problem_name,
+            EvaluationRunStatus.error,
+            {
+                "error_code": EvaluationRunErrorCode.VALIDATOR_INTERNAL_ERROR.value,
+                "error_message": (
+                    f"{EvaluationRunErrorCode.VALIDATOR_INTERNAL_ERROR.get_error_message()}: {e}\n\n"
+                    f"Traceback:\n{traceback.format_exc()}"
+                ),
+            },
+        )
+
+    # Upload artifacts for both success and error cases (per attempt; the run's
+    # S3 key always holds the latest attempt's artifacts)
+    if artifact_upload_url and job_dir:
+        await _upload_job_artifacts(job_dir, artifact_upload_url)
+
+    return terminal_response
+
+
+# Run an evaluation run (all of its attempts)
+async def _run_evaluation_run(
+    evaluation_run,
+    agent_code: str,
+    artifact_upload_url: str | None = None,
+    openrouter_config: OpenRouterRuntimeConfig | None = None,
+):
+    evaluation_run_id = evaluation_run.evaluation_run_id
+    problem_name = evaluation_run.problem_name
+    task_digest = (evaluation_run.execution_spec or {}).get("task_digest")
+    if task_digest:
+        _active_task_digests.add(task_digest)
+
+    try:
+        logger.info(f"Starting evaluation run {evaluation_run_id} for problem {problem_name}...")
+
+        attempt_number = 1
+        while True:
+            response = await _run_single_attempt(
+                evaluation_run, agent_code, attempt_number, artifact_upload_url, openrouter_config
+            )
+            if not response.retry:
+                break
+            attempt_number = response.attempt_number or attempt_number + 1
+            artifact_upload_url = response.artifact_upload_url or artifact_upload_url
+            logger.info(
+                f"Platform granted a retry for evaluation run {evaluation_run_id} "
+                f"(problem {problem_name}); starting attempt {attempt_number}"
+            )
+
+        logger.info(f"Finished evaluation run {evaluation_run_id} for problem {problem_name}")
+
+    except Exception as e:
+        logger.error(f"Error in _run_evaluation_run(): {type(e).__name__}: {e}", exc_info=True)
+        os._exit(1)
+    finally:
+        if task_digest:
+            _active_task_digests.discard(task_digest)
+
+
+async def _poll_evaluation_cancellation(
+    evaluation_id: UUID,
+    agent_id: UUID,
+    cancellation_event: asyncio.Event,
+    cancellation_reason: dict[str, str | None],
+) -> None:
+    """Poll the platform for a stop signal.
+
+    Args:
+        evaluation_id: Active evaluation on the platform.
+        agent_id: Agent being evaluated.
+        cancellation_event: Set when the platform asks this process to stop.
+        cancellation_reason: Mutable holder for the platform-provided reason.
+    """
+
+    logger.info(
+        f"Starting cancellation polling for evaluation {evaluation_id} "
+        f"every {config.VALIDATOR_CANCELLATION_CHECK_INTERVAL_SECONDS}s"
+    )
+
+    while not cancellation_event.is_set():
+        try:
+            response_data = await post_ridges_platform(
+                "/validator/check-cancellation",
+                ValidatorCheckCancellationRequest(evaluation_id=evaluation_id, agent_id=agent_id),
+                bearer_token=session_id,
+                quiet=2,
+                timeout=5,
+            )
+            response = ValidatorCheckCancellationResponse(**response_data)
+            if response.should_cancel:
+                cancellation_reason["reason"] = response.reason
+                cancellation_event.set()
+                return
+
+        except asyncio.CancelledError:
+            raise
+        except httpx.HTTPStatusError as exc:
+            logger.warning(f"Cancellation check failed with HTTP {exc.response.status_code}; continuing evaluation.")
+        except httpx.TimeoutException as exc:
+            logger.warning(f"Cancellation check timed out; continuing evaluation. {type(exc).__name__}: {exc}")
+        except Exception as exc:
+            logger.warning(f"Cancellation check failed; continuing evaluation. {type(exc).__name__}: {exc}")
+
+        try:
+            await asyncio.wait_for(
+                cancellation_event.wait(),
+                timeout=config.VALIDATOR_CANCELLATION_CHECK_INTERVAL_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            pass
+
+
+async def _wait_for_evaluation_run_tasks(tasks: list[asyncio.Task]) -> None:
+    """Wait for problem-run tasks.
+
+    Args:
+        tasks: Local problem-run tasks.
+    """
+    await asyncio.gather(*tasks)
+
+
+async def _pre_build_missing_images(request_evaluation_response: ValidatorRequestEvaluationResponse) -> None:
+    """Fire off BuildKit builds for every task image not yet in the registry,
+    before any evaluation run starts.
+    Best-effort and non-blocking on failure: this never raises. If it fails
+    or is skipped, the normal per-task lazy build path in
+    ``RidgesKubernetesEnvironment._ensure_image()`` still runs as a fallback.
+    """
+    if config.RIDGES_ENVIRONMENT_TYPE != "kubernetes":
+        return
+
+    from models.harbor_task import HarborRemoteTaskExecutionSpec
+    from ridges_harbor.k8s_environment import pre_build_images
+
+    async def _resolve_task(evaluation_run) -> tuple[str, str, str] | None:
+        spec = evaluation_run.execution_spec
+        if not spec or spec.get("kind") != "harbor_remote_task":
+            return None
+        try:
+            parsed = HarborRemoteTaskExecutionSpec.model_validate(spec)
+        except Exception as exc:
+            logger.debug(f"Pre-build: skipping invalid execution spec for {evaluation_run.problem_name}: {exc}")
+            return None
+        try:
+            presigned_url = await _fetch_task_download_url(parsed.task_digest)
+        except Exception as exc:
+            logger.warning(f"Pre-build: failed to get download URL for {parsed.task_name}: {exc}")
+            return None
+        digest_tag = parsed.task_digest.split(":")[1][:12]
+        return parsed.task_name, digest_tag, presigned_url
+
+    try:
+        resolved = await asyncio.gather(*(_resolve_task(run) for run in request_evaluation_response.evaluation_runs))
+        tasks = [task for task in resolved if task is not None]
+        if not tasks:
+            return
+
+        logger.info(f"Pre-building {len(tasks)} task image(s) ahead of evaluation runs...")
+        await pre_build_images(
+            tasks,
+            namespace=config.K8S_NAMESPACE,
+            registry=config.K8S_REGISTRY,
+            registry_insecure=config.K8S_REGISTRY_INSECURE,
+            registry_credentials_secret=config.K8S_REGISTRY_SECRET,
+            registry_password=config.K8S_REGISTRY_PASSWORD,
+            build_registry=config.K8S_BUILD_REGISTRY,
+            build_registry_insecure=config.K8S_BUILD_REGISTRY_INSECURE,
+            kubeconfig_context=config.K8S_CONTEXT,
+        )
+    except Exception as exc:
+        logger.warning(f"Pre-build step failed; falling back to per-task lazy builds: {type(exc).__name__}: {exc}")
+
+
+def _log_received_evaluation(request_evaluation_response: ValidatorRequestEvaluationResponse) -> None:
+    """Log an evaluation assignment.
+
+    Args:
+        request_evaluation_response: Assignment returned by the platform.
+    """
+
+    logger.info("Received evaluation:")
+    logger.info(f"  Evaluation ID: {request_evaluation_response.evaluation_id}")
+    logger.info(f"  Agent ID: {request_evaluation_response.agent_id}")
+    logger.info(f"  # of evaluation runs: {len(request_evaluation_response.evaluation_runs)}")
+
+    for evaluation_run in request_evaluation_response.evaluation_runs:
+        logger.info(f"    {evaluation_run.problem_name}")
+
+
+def _create_evaluation_run_tasks(request_evaluation_response: ValidatorRequestEvaluationResponse) -> list[asyncio.Task]:
+    """Create local problem-run tasks.
+
+    Args:
+        request_evaluation_response: Assignment returned by the platform.
+
+    Returns:
+        Scheduled tasks for each problem run.
+    """
+
+    tasks = []
+    semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_EVALUATION_RUNS)
+
+    for evaluation_run in request_evaluation_response.evaluation_runs:
+        evaluation_run_id = evaluation_run.evaluation_run_id
+        problem_name = evaluation_run.problem_name
+
+        if config.SIMULATE_EVALUATION_RUNS:
+            tasks.append(
+                asyncio.create_task(
+                    _simulate_run_evaluation_run_with_semaphore(evaluation_run_id, problem_name, semaphore)
+                )
+            )
+        else:
+            upload_url = request_evaluation_response.artifact_upload_urls.get(str(evaluation_run_id))
+            tasks.append(
+                asyncio.create_task(
+                    _run_evaluation_run_with_semaphore(
+                        evaluation_run,
+                        request_evaluation_response.agent_code,
+                        semaphore,
+                        artifact_upload_url=upload_url,
+                        openrouter_config=request_evaluation_response.openrouter_config,
+                    )
+                )
+            )
+
+    return tasks
+
+
+async def _wait_for_runs_or_cancellation(
+    run_tasks: list[asyncio.Task],
+    cancellation_event: asyncio.Event,
+) -> tuple[asyncio.Task, asyncio.Task]:
+    """Wait for local completion or a platform stop signal.
+
+    Starts one task that waits for all problem runs and one task that waits
+    for the platform stop event. Returns as soon as either one finishes.
+
+    Args:
+        run_tasks: Local problem-run tasks.
+        cancellation_event: Set by the polling task when the platform asks us to stop.
+
+    Returns:
+        The wrapper task for all runs and the task waiting on cancellation.
+    """
+
+    run_tasks_task = asyncio.create_task(_wait_for_evaluation_run_tasks(run_tasks))
+    cancellation_wait_task = asyncio.create_task(cancellation_event.wait())
+    await asyncio.wait(
+        {run_tasks_task, cancellation_wait_task},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    return run_tasks_task, cancellation_wait_task
+
+
+async def _cancel_evaluation_run_tasks(run_tasks: list[asyncio.Task], run_tasks_task: asyncio.Task) -> None:
+    """Cancel unfinished problem-run tasks.
+
+    Args:
+        run_tasks: Local problem-run tasks.
+        run_tasks_task: Wrapper task waiting for all problem-run tasks.
+    """
+
+    for task in run_tasks:
+        if not task.done():
+            task.cancel()
+    await asyncio.gather(*run_tasks, return_exceptions=True)
+
+    if not run_tasks_task.done():
+        run_tasks_task.cancel()
+    await asyncio.gather(run_tasks_task, return_exceptions=True)
+
+
+async def _acknowledge_platform_cancellation(
+    request_evaluation_response: ValidatorRequestEvaluationResponse,
+    reason: str,
+) -> None:
+    """Acknowledge a platform-requested stop.
+
+    Args:
+        request_evaluation_response: Active evaluation assignment.
+        reason: Reason sent back to the platform.
+    """
+
+    await retry_with_backoff(
+        lambda: post_ridges_platform(
+            "/validator/cancel-current-evaluation",
+            ValidatorCancelCurrentEvaluationRequest(
+                evaluation_id=request_evaluation_response.evaluation_id,
+                agent_id=request_evaluation_response.agent_id,
+                reason=reason,
+            ),
+            bearer_token=session_id,
+            quiet=1,
+        ),
+        max_attempts=3,
+        base_delay=2.0,
+    )
+
+
+async def _cancel_background_tasks(*tasks: asyncio.Task | None) -> None:
+    """Cancel optional background tasks.
+
+    Args:
+        *tasks: Background tasks that may or may not exist.
+    """
+
+    cleanup_tasks = []
+    for task in tasks:
+        if task is not None:
+            task.cancel()
+            cleanup_tasks.append(task)
+
+    if cleanup_tasks:
+        await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+
+
+async def _run_evaluation(request_evaluation_response: ValidatorRequestEvaluationResponse):
+    """Run one assigned evaluation.
+
+    Args:
+        request_evaluation_response: Evaluation and problem runs assigned by the platform.
+    """
+    cancellation_event = asyncio.Event()
+    cancellation_reason: dict[str, str | None] = {"reason": None}
+    poll_task: asyncio.Task | None = None
+    cancellation_wait_task: asyncio.Task | None = None
+    run_tasks_task: asyncio.Task | None = None
+
+    _log_received_evaluation(request_evaluation_response)
+    logger.info("Starting evaluation...")
+
+    try:
+        if config.RIDGES_ENVIRONMENT_TYPE == "kubernetes":
+            from utils.k8s import set_screener_safe_to_evict
+
+            await asyncio.to_thread(set_screener_safe_to_evict, False)
+
+        await _pre_build_missing_images(request_evaluation_response)
+
+        tasks = _create_evaluation_run_tasks(request_evaluation_response)
+
+        poll_task = asyncio.create_task(
+            _poll_evaluation_cancellation(
+                request_evaluation_response.evaluation_id,
+                request_evaluation_response.agent_id,
+                cancellation_event,
+                cancellation_reason,
+            )
+        )
+
+        run_tasks_task, cancellation_wait_task = await _wait_for_runs_or_cancellation(tasks, cancellation_event)
+
+        if cancellation_event.is_set():
+            reason = cancellation_reason["reason"] or "The platform cancelled this evaluation."
+            logger.info(f"Platform requested evaluation cancellation: {reason}")
+            await _cancel_evaluation_run_tasks(tasks, run_tasks_task)
+            await _acknowledge_platform_cancellation(request_evaluation_response, reason)
+            logger.info("Cancelled evaluation")
+            return
+
+        if poll_task is not None:
+            await _cancel_background_tasks(poll_task)
+            poll_task = None
+
+        await run_tasks_task
+
+        logger.info("Finished evaluation")
+
+        await post_ridges_platform(
+            "/validator/finish-evaluation", ValidatorFinishEvaluationRequest(), bearer_token=session_id, quiet=1
+        )
+    finally:
+        await _cancel_background_tasks(cancellation_wait_task, poll_task)
+        if config.RIDGES_ENVIRONMENT_TYPE == "docker":
+            await asyncio.to_thread(prune_docker_disk_resources)
+        elif config.RIDGES_ENVIRONMENT_TYPE == "kubernetes":
+            from utils.k8s import cleanup_completed_k8s_eval_pods, set_screener_safe_to_evict
+
+            await asyncio.to_thread(cleanup_completed_k8s_eval_pods)
+            await asyncio.to_thread(set_screener_safe_to_evict, True)
+
+
+async def _update_docker_plugins() -> None:
+    script = pathlib.Path(__file__).resolve().parents[1] / "setup" / "update-docker-plugins.sh"
+    logger.info("Running Docker plugin startup update...")
+    process = await asyncio.create_subprocess_exec("bash", str(script), start_new_session=True)
+    try:
+        returncode = await asyncio.wait_for(process.wait(), timeout=600)
+    except BaseException:
+        if process.returncode is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        await process.wait()
+        raise
+    if returncode != 0:
+        raise RuntimeError(f"Docker plugin startup update failed (exit {returncode}); see script output above")
+
+
+# Main loop
+async def main():
+    global session_id
+    global running_agent_timeout_seconds
+    global running_eval_timeout_seconds
+    global max_evaluation_run_log_size_bytes
+    global environment_build_timeout_multiplier
+    global execution_engine
+
+    setup_logging()
+    asyncio.get_running_loop().set_default_executor(
+        concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(64, config.MAX_CONCURRENT_EVALUATION_RUNS * 2 + 32),
+            thread_name_prefix="validator-worker",
+        )
+    )
+    await _run_startup_tasks()
+
+    # Register with the Ridges platform, yielding us a session ID
+    logger.info("Registering validator...")
+
+    try:
+        if config.MODE == "validator":
+            # Get the current timestamp, and sign it with the validator hotkey
+            timestamp = int(time.time())
+            signed_timestamp = config.VALIDATOR_HOTKEY.sign(str(timestamp)).hex()
+
+            register_response = ValidatorRegistrationResponse(
+                **(
+                    await post_ridges_platform(
+                        "/validator/register-as-validator",
+                        ValidatorRegistrationRequest(
+                            timestamp=timestamp,
+                            signed_timestamp=signed_timestamp,
+                            hotkey=config.VALIDATOR_HOTKEY.ss58_address,
+                            commit_hash=COMMIT_HASH,
+                        ),
+                    )
+                )
+            )
+
+        elif config.MODE == "screener":
+            register_response = ScreenerRegistrationResponse(
+                **(
+                    await post_ridges_platform(
+                        "/validator/register-as-screener",
+                        ScreenerRegistrationRequest(
+                            name=config.SCREENER_NAME, password=config.SCREENER_PASSWORD, commit_hash=COMMIT_HASH
+                        ),
+                    )
+                )
+            )
+
+    except httpx.HTTPStatusError as e:
+        if config.UPDATE_AUTOMATICALLY and e.response.status_code == 426:
+            logger.info("Updating...")
+            reset_local_repo(pathlib.Path(__file__).parent.parent, e.response.headers["X-Commit-Hash"])
+            sys.exit(0)
+        else:
+            raise e
+
+    session_id = register_response.session_id
+    running_agent_timeout_seconds = register_response.running_agent_timeout_seconds
+    running_eval_timeout_seconds = register_response.running_eval_timeout_seconds
+    max_evaluation_run_log_size_bytes = register_response.max_evaluation_run_log_size_bytes
+    environment_build_timeout_multiplier = register_response.environment_build_timeout_multiplier
+
+    logger.info("Registered validator:")
+    logger.info(f"  Session ID: {session_id}")
+    logger.info(f"  Running Agent Timeout: {running_agent_timeout_seconds} second(s)")
+    logger.info(f"  Running Evaluation Timeout: {running_eval_timeout_seconds} second(s)")
+    logger.info(f"  Max Evaluation Run Log Size: {max_evaluation_run_log_size_bytes} byte(s)")
+    logger.info(f"  Environment Build Timeout Multiplier: {environment_build_timeout_multiplier}x")
+
+    execution_engine = ExecutionEngine(
+        harbor_results_dir=config.RIDGES_HARBOR_RESULTS_DIR,
+        harbor_debug=config.RIDGES_HARBOR_DEBUG,
+        max_agent_timeout_sec=running_agent_timeout_seconds,
+        max_eval_timeout_sec=running_eval_timeout_seconds,
+        max_cost_usd=config.RIDGES_MAX_COST_USD,
+        build_timeout_multiplier=environment_build_timeout_multiplier,
+    )
+
+    # Start the heartbeat sender on its own thread
+    start_heartbeat_thread(session_id)
+
+    if config.MODE == "validator":
+        # Start the set weights loop
+        asyncio.create_task(set_weights_loop())
+
+    # Start the low-priority local-storage cleanup loop (validator and screener).
+    if config.CLEANUP_ENABLED:
+        asyncio.create_task(cleanup_loop(_active_task_digests))
+
+    if config.RIDGES_ENVIRONMENT_TYPE == "docker" and not config.SIMULATE_EVALUATION_RUNS:
+        await _update_docker_plugins()
+
+    # Loop forever, just keep requesting evaluations and running them
+    while True:
+        if _shutdown_requested:
+            logger.info("Shutdown requested — disconnecting gracefully")
+            await disconnect("SIGTERM (graceful)")
+            os._exit(0)
+
+        logger.info("Requesting an evaluation...")
+
+        request_evaluation_response_data = await post_ridges_platform(
+            "/validator/request-evaluation", ValidatorRequestEvaluationRequest(), bearer_token=session_id, quiet=1
+        )
+
+        # If no evaluation is available, wait and try again
+        if request_evaluation_response_data is None:
+            logger.info(
+                f"No evaluations available. Waiting for {config.REQUEST_EVALUATION_INTERVAL_SECONDS} seconds..."
+            )
+            await asyncio.sleep(config.REQUEST_EVALUATION_INTERVAL_SECONDS)
+            continue
+
+        await _run_evaluation(ValidatorRequestEvaluationResponse(**request_evaluation_response_data))
+        logger.info(f"Evaluation complete. Waiting for {config.REQUEST_EVALUATION_INTERVAL_SECONDS} seconds...")
+        await asyncio.sleep(config.REQUEST_EVALUATION_INTERVAL_SECONDS)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.warning("Keyboard interrupt")
+        asyncio.run(disconnect("Keyboard interrupt"))
+        os._exit(1)
+    except Exception as e:
+        logger.error(f"Error in main(): {type(e).__name__}: {e}", exc_info=True)
+        asyncio.run(disconnect(f"Error in main(): {type(e).__name__}: {e}"))
+        os._exit(1)
