@@ -1,3 +1,48 @@
+"""An agent that repairs a defect in a checked-out repository and hands in a patch.
+
+`agent_main(input)` is the entry point. It is given a problem statement and a
+checkout in the working directory, and returns a unified diff against the
+commit the checkout started from. Nothing else is an answer: a change made
+anywhere but in those files is not handed in, and an empty diff is no answer at
+all.
+
+The design follows one rule. The task statement is the authority, and
+everything this run claims has to be traceable to the statement's own words or
+to something that actually happened in the checkout. So the statement is read
+for the file, the method, the commands and the limits it names; evidence is
+recorded against the identity of the source it ran on; and a claim with nothing
+behind it is reported as unestablished rather than asserted.
+
+How the file is laid out, in order:
+
+* Settings and prices. Every switch is an environment flag with a default, so
+  one build serves every configuration, and a price table turns token counts
+  into money.
+* `Beacon`. One named slot of the run log per optional behaviour. Each one
+  reports that it was reached, skipped or fired, so a run reads as a sequence
+  of decisions.
+* `Allowance`. What the run may still spend in time and money, and the one
+  place that decides when work must stop.
+* `Seat`. The model seats, in order, with the ladder that reshapes a refused
+  request rather than giving up on it.
+* `CheckoutSnapshot` and `Tree`. The checkout: every read and write, the copy
+  taken at the start so it can be put back exactly, and the diff that becomes
+  the answer.
+* Patch readers. Splitting an answer by file, reading what each section does,
+  and dropping what the statement puts out of bounds.
+* `Shell`, `ShellPool`, `ClickHouseHttp` and `HttpProbe`. Running commands and
+  database statements in the background, with lanes so two things never use the
+  same resource at once.
+* Statement readers. The file, the method, the commands, the requirements, the
+  prohibitions and the limits, each read from the statement's literal words.
+* `Warden`. Runs the project's own checks and holds the hand-in to the
+  statement, quoting the clause behind every refusal.
+* `Kit` and `TOOL_SCHEMAS`. The tools the model may call, and the bookkeeping
+  that keeps their results honest.
+* `BRIEF`. The standing instructions the model works to.
+* `run_plan`, `drive` and `agent_main`. The planning seat, the working loop,
+  and the assembly of the answer.
+"""
 from __future__ import annotations
 import ast
 import bisect
@@ -126,6 +171,9 @@ MODEL_PROFILES = (("anthropic/", {"temperature": False, "cache": True}),)
 
 
 def model_profile(model: str) -> dict:
+    """The request quirks of a model family, by name prefix: an empty profile means the plain
+    request shape.
+    """
     for prefix, profile in MODEL_PROFILES:
         if (model or "").startswith(prefix):
             return profile
@@ -193,9 +241,16 @@ SEARCH_OUTPUT_CAP = 8_000
 TEMPERATURE = 0.0
 
 def one_line(value: object) -> str:
+    """A value as one line of text, with every run of whitespace collapsed to a single space."""
     return " ".join(str(value or "").split())
 
 def reply_fingerprint(message: dict) -> str:
+    """A short digest of what a reply said, so an identical reply can be recognised.
+
+    Tool calls identify a reply when it made any; otherwise its text does. Two replies with
+    the same fingerprint carry the same instruction, which is how a loop that is going
+    nowhere is noticed.
+    """
     import hashlib
     calls = (message or {}).get("tool_calls") if isinstance(message, dict) else None
     parts = []
@@ -209,24 +264,37 @@ def reply_fingerprint(message: dict) -> str:
     return hashlib.sha256(said.encode("utf-8", "replace")).hexdigest()[:8]
 
 def finite_number(value: object) -> bool:
+    """Is this a real number this run can do arithmetic with? Booleans, NaN and the infinities are
+    not.
+    """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False
     return value == value and value not in (float("inf"), float("-inf"))
 
 def whole_number(value: object) -> int:
+    """A usage field as a whole number, or -1 when the field is missing or not a number."""
     return int(value) if finite_number(value) else -1
 
 COUNT_CEILING = 100_000_000
 
 def counted(value: object) -> int:
+    """A count from a reply, clamped to a sane range: a provider's figure is read, never trusted.
+    """
     return min(COUNT_CEILING, max(0, whole_number(value)))
 
 def reasoning_tokens(usage: dict) -> int:
+    """Tokens the model spent on reasoning, from the nested usage detail, or -1 when it is absent.
+    """
     details = (usage or {}).get("completion_tokens_details")
     return whole_number(details.get("reasoning_tokens")
                         if isinstance(details, dict) else None)
 
 def prompt_split(usage: dict) -> tuple:
+    """(fresh prompt tokens, cached prompt tokens) from one reply's usage.
+
+    The cached part is subtracted from the total only when it is a sensible share of it, so
+    a provider that reports the two differently cannot make the fresh count negative.
+    """
     usage = usage or {}
     total = usage.get("prompt_tokens")
     details = usage.get("prompt_tokens_details")
@@ -240,6 +308,8 @@ CACHE_WRITE_FIELDS = ("cache_creation_input_tokens", "cache_creation_tokens",
                       "cached_tokens_write")
 
 def cache_written(usage: dict) -> int:
+    """Tokens written to the prompt cache, from whichever field name the provider uses, or -1.
+    """
     usage = usage or {}
     details = usage.get("prompt_tokens_details")
     details = details if isinstance(details, dict) else {}
@@ -250,6 +320,8 @@ def cache_written(usage: dict) -> int:
     return -1
 
 def flag(name: str, default: str = "1") -> bool:
+    """An on/off switch read from the environment, on unless the value plainly says otherwise.
+    """
     return (os.getenv(name) or default).strip().lower() not in ("0", "no", "off", "false", "")
 
 PARALLEL_TOOLS = flag("RIDGES_PARALLEL_TOOLS")
@@ -274,6 +346,8 @@ OOM_YIELD = '{ echo 1000 > /proc/self/oom_score_adj; } 2>/dev/null; exec bash -l
 
 
 def job_argv(command: str) -> list:
+    """The argv that runs one shell command, with the memory shield in front of it when it is on.
+    """
     return ["bash", "-c", OOM_YIELD, "bash", command] if OOM_SHIELD else ["bash", "-lc", command]
 REPLACE_ALL = flag("RIDGES_REPLACE_ALL")
 ASYNC_SHELL = flag("RIDGES_ASYNC_SHELL")
@@ -322,6 +396,9 @@ QUERY_CHECKS = flag("RIDGES_QUERY_CHECKS")
 REQUIREMENT_PAUSE = flag("RIDGES_REQUIREMENT_PAUSE")
 
 def num_env(name: str, default: float) -> float:
+    """A number read from the environment, falling back to the default when it is absent or
+    unusable.
+    """
     try:
         value = float((os.getenv(name) or "").strip())
     except (TypeError, ValueError):
@@ -329,12 +406,19 @@ def num_env(name: str, default: float) -> float:
     return value if value == value and value not in (float("inf"), float("-inf")) else default
 
 def say(message: str) -> None:
+    """Write one line to the run log, and never let a closed or broken stream end the run."""
     try:
         print(message, flush=True)
     except (OSError, ValueError):
         pass
 
 class Beacon:
+    """One named slot of the run log.
+
+    Every optional behaviour of this agent reports through a beacon: that it was reached,
+    that it was skipped and why, or that it fired and with what detail. The slots are fixed
+    and short, so a run's log can be read as a sequence of decisions rather than prose.
+    """
     SLOTS = ("bgshell", "conform", "editall", "fence", "findings", "ledger",
              "plan", "prelocate", "preview", "sweep", "trim", "verbatim",
              "warden", "batch", "idnorm", "retry", "scan", "scanledger",
@@ -346,6 +430,7 @@ class Beacon:
              "steady", "meter", "scope_statement", "review", "expect", "green", "second")
 
     def __init__(self, slug: str) -> None:
+        """Open a slot by name and start its call and spend tallies at zero."""
         self.name = slug.lower()
         self.slug = self.tag(self.name)
         self.calls = 0
@@ -353,6 +438,7 @@ class Beacon:
 
     @classmethod
     def tag(cls, name: str) -> str:
+        """The short label this slot prints under, numbered when numbered slots are on."""
         if not TELEMETRY_SLOTS:
             return "SCOPE" if name == "scope_statement" else name.upper()
         try:
@@ -361,39 +447,61 @@ class Beacon:
             return name.upper()
 
     def reached(self, step: int, spent: float, clock: float) -> None:
+        """Record that the run arrived at this slot, with the step, the spend and the clock at that
+        moment.
+        """
         say("[%s] reached step=%d spent=$%.4f clock=%.0fs" % (self.slug, step, spent, clock))
 
     def skipped(self, reason: str) -> None:
+        """Record that this slot did nothing, and why, so silence is never ambiguous."""
         say("[%s] skipped: %s" % (self.slug, reason))
 
     def fired(self, detail: str) -> None:
+        """Record that this slot acted, with the detail that justified it."""
         say("[%s] fired: %s" % (self.slug, detail[:400]))
 
     def artefact(self, when: str, blob: str) -> str:
+        """Record the digest and size of a text this slot is about to change, and return the
+        digest.
+        """
         import hashlib
         digest = hashlib.sha256((blob or "").encode("utf-8", "replace")).hexdigest()[:8]
         say("[%s] %s %s %dB" % (self.slug, when, digest, len(blob or "")))
         return digest
 
     def outcome(self, before_digest: str, after: str) -> None:
+        """Record the digest and size of the text afterwards, and whether it changed at all."""
         import hashlib
         digest = hashlib.sha256((after or "").encode("utf-8", "replace")).hexdigest()[:8]
         changed = "yes" if digest != before_digest else "no"
         say("[%s] after %s %dB changed=%s" % (self.slug, digest, len(after or ""), changed))
 
     def bill(self) -> None:
+        """Record what this slot cost: how many model calls it made and how much they came to.
+        """
         say("[%s] cost calls=%d usd=%.4f" % (self.slug, self.calls, self.usd))
 
 class Spent(Exception):
+    """The run has no allowance left to finish what it was asked to do."""
     pass
 
 class ReadExpired(Exception):
+    """A read ran past the time it was given, so its result is incomplete and must not be used.
+    """
     pass
 
 class Allowance:
+    """What the run may still spend: wall clock, money, and the tallies kept against both.
+
+    Every budget decision in the agent asks this object rather than the clock or the
+    provider, so one place decides when work must stop and hand in what it has.
+    """
     quoted_calls = 0
 
     def __init__(self) -> None:
+        """Read the wall clock and the money cap for this run and set the deadline a reserve short
+        of both.
+        """
         self.started = time.time()
         wall = num_env("AGENT_TIMEOUT", DEFAULT_WALL_SEC)
         self.ceiling_usd = num_env("RIDGES_MAX_COST_USD", DEFAULT_COST_LIMIT_USD)
@@ -405,15 +513,20 @@ class Allowance:
         self.tests_run = 0
 
     def clock_left(self) -> float:
+        """Seconds left before the deadline this run set itself, which is short of the real one.
+        """
         return self.deadline - time.time()
 
     def money_left(self) -> float:
+        """Dollars left under the soft cap, which is a share of the real ceiling."""
         return self.soft_usd - self.spent
 
     def elapsed(self) -> float:
+        """Seconds since the run started."""
         return time.time() - self.started
 
     def halt_reason(self) -> str:
+        """Why work must stop now, in a word, or empty while it may go on."""
         if self.clock_left() <= 0:
             return "wall clock"
         if self.money_left() <= 0:
@@ -422,6 +535,13 @@ class Allowance:
 
     def charge(self, model: str, usage: dict, *, prompt_estimate: int = 0,
                completion_reserve: int = 0) -> float:
+        """Book one model call against the run's money, and return what it cost.
+
+        A charge the provider reports is taken as it stands, because it has already
+        happened. When no charge is reported the cost is worked out from the token
+        counts and this run's price table, and an unknown model is priced at the dearest
+        row so an unpriced seat cannot quietly overspend.
+        """
         self.calls += 1
         usage = usage if isinstance(usage, dict) else {}
         quoted = usage.get("cost")
@@ -461,6 +581,8 @@ class Allowance:
         return cost
 
 def call_ident(call: dict, index: int) -> str:
+    """The id a tool call came with, or a positional stand-in so every call can still be answered.
+    """
     ident = call.get("id")
     return ident if isinstance(ident, str) and ident else "call_%d" % index
 
@@ -512,6 +634,12 @@ def usable_calls(raw: object, used_ids: set | None = None) -> list:
     return kept
 
 def recorded_calls(calls: list) -> list:
+    """The tool calls worth carrying in the transcript, with unreadable arguments marked rather
+    than dropped.
+
+    A call whose arguments are not an object cannot be run, but leaving it out of the
+    transcript would make the reply that follows look unprompted.
+    """
     kept = []
     for index, call in enumerate(calls):
         if not isinstance(call, dict):
@@ -531,6 +659,12 @@ def recorded_calls(calls: list) -> list:
     return kept
 
 def transcript_cap_chars(model: str, ceiling_usd: float) -> int:
+    """How much transcript this model can be re-sent each turn without the cache bill outgrowing
+    the run.
+
+    The cap is the smaller of what the budget affords over the planned turns and a safe
+    share of the model's window, never below a floor that keeps the work legible.
+    """
     cache_price, window = SEAT_CACHE_TERMS.get(model, UNKNOWN_CACHE_TERMS)
     affordable = (ceiling_usd * TRANSCRIPT_SPEND_SHARE) / (TURNS_PLANNED * cache_price)
     tokens = min(affordable, window * 0.6)
@@ -539,6 +673,9 @@ def transcript_cap_chars(model: str, ceiling_usd: float) -> int:
 FINISH_REASONS = ("stop", "length", "tool_calls", "content_filter", "error", "")
 
 def foreign(text: str) -> str:
+    """The size of a body this run will not interpret, for the log: its bytes, or that it was
+    empty.
+    """
     body = "" if text is None else str(text)
     return "%dB" % len(body.encode("utf-8", "replace")) if body else "empty"
 
@@ -557,6 +694,9 @@ CREDIT_REFUSAL = re.compile(
     r"quota", re.I)
 
 def refusal_reason(detail: str) -> str:
+    """The provider's own words for a refusal, unwrapped from JSON, collapsed, redacted and
+    clipped.
+    """
     body = "" if detail is None else str(detail)
     if not body.strip():
         return ""
@@ -570,6 +710,8 @@ def refusal_reason(detail: str) -> str:
     return said[:REFUSAL_REASON_CHARS]
 
 def retry_after_seconds(headers) -> float:
+    """The wait a response asked for in its headers, in seconds, or zero when it asked for none.
+    """
     try:
         said = headers.get("Retry-After")
     except Exception:
@@ -625,18 +767,27 @@ def read_within(response, seconds: float, *, deadline: float | None = None,
             raise ValueError("the reply is larger than %d bytes" % max_bytes)
 
 class SeatRefused(Exception):
+    """A seat would not answer this request. The run changes seats or asks again rather than
+    stopping.
+    """
     pass
 
 class SeatTimedOut(SeatRefused):
+    """A seat did not answer inside the time it was given."""
     pass
 
 class SeatAbsent(SeatRefused):
+    """A seat is not there to answer: the model or the route is unknown to the endpoint."""
     pass
 
 class SeatRateLimited(SeatRefused):
+    """A seat is answering other work first, so this request must wait or move."""
     pass
 
 def base_urls() -> list[str]:
+    """Where inference requests go: the sandbox proxy when one is given, otherwise the configured
+    endpoint.
+    """
     proxy = (os.getenv("SANDBOX_PROXY_URL") or "").strip().rstrip("/")
     if proxy:
         return [proxy + "/api/v1"]
@@ -654,6 +805,14 @@ def request_seed(statement: str) -> int:
 
 
 class Seat:
+    """The model seats this run may ask, in order, with the retry ladder that keeps a run alive.
+
+    One seat is the driver; the others take over when it times out, refuses or is unknown.
+    Every optional part of a request (the seed, the reasoning field, the parallel-calls
+    field, the temperature) is dropped in turn when an endpoint refuses it, so a request is
+    reshaped rather than abandoned, and the run ends on its own budget rather than on one
+    endpoint's bad stretch.
+    """
     roster: list = []
     patient = True
     impatient_sec = 60.0
@@ -664,6 +823,7 @@ class Seat:
                  patient: bool = True, impatient_sec: float = 60.0,
                  effort: str | None = None,
                  reply_ceiling: int | None = None) -> None:
+        """Set up a seat roster with this run's reasoning effort, reply ceiling and patience."""
         self.allowance = allowance
         self.patient = patient
         self.impatient_sec = impatient_sec
@@ -694,6 +854,7 @@ class Seat:
         )
 
     def current(self) -> str:
+        """The model this seat is asking now."""
         return self.models[0]
 
     prompt_chars = 0
@@ -778,6 +939,8 @@ class Seat:
         return self.reply_cap
 
     def retire(self, model: str) -> bool:
+        """Drop a model from the roster for the rest of the run, unless it is the last one left.
+        """
         if model in self.models and len(self.models) > 1:
             self.models.remove(model)
             if model in self.roster:
@@ -787,6 +950,11 @@ class Seat:
         return False
 
     def ask(self, messages: list[dict], tools: list[dict] | None) -> dict:
+        """Ask the seats for one reply, and put aside any model a spending limit removed.
+
+        A limit that belongs to the key rather than to the model is not a reason to lose
+        that model for the whole run, so such a seat goes back on the roster afterwards.
+        """
         budget = list(self._budget())
         aside: list[str] = []
         try:
@@ -801,6 +969,9 @@ class Seat:
 
     def _ask(self, messages: list[dict], tools: list[dict] | None,
              budget, aside: list) -> dict:
+        """Walk the roster until a seat answers, changing seats on a refusal and retiring one that
+        keeps timing out.
+        """
         budget = budget if budget is not None else list(self._budget())
         while True:
             model = self.current()
@@ -846,6 +1017,9 @@ class Seat:
                 budget[:] = self._budget()
 
     def _budget(self):
+        """How long this request may take: the whole clock before the first edit, a share of it
+        afterwards.
+        """
         left = self.allowance.clock_left()
         if not self.allowance.edits:
             share = left
@@ -857,6 +1031,14 @@ class Seat:
                  budget=None) -> dict:
         # Tool arguments and tool schemas are input too, so measure what will
         # actually be serialised rather than message text alone.
+        """One request to one model, with the ladder that reshapes it rather than giving up.
+
+        The body is built, sent and read inside the time this request was given. A
+        refusal that names an optional field loses that field and is asked again; a
+        reply that ran out of room gets a higher ceiling; a reply with no content and no
+        calls is regrown. What comes back is booked against the allowance before it is
+        returned.
+        """
         try:
             self.prompt_chars = (len(json.dumps(messages or []))
                                  + len(json.dumps(tools or [])))
@@ -1169,6 +1351,8 @@ class Seat:
         raise Spent("no reply after %d attempts: %s" % (attempt + 1, said))
 
     def _tally(self, attempt: int, old_bench_at: int, recovered: bool) -> None:
+        """Record what the retry ladder did, and what the older ladder would have done instead.
+        """
         RETRY_TALLY["retried"] += 1
         if recovered:
             RETRY_TALLY["recovered"] += 1
@@ -1183,6 +1367,8 @@ class Seat:
             % (attempt + 1, "yes" if recovered else "no", was))
 
     def _book(self, model: str, parsed: dict) -> dict:
+        """Read one reply, charge it to the allowance, and return the message with what it cost.
+        """
         choices = parsed.get("choices") or []
         if not choices:
             raise Spent("reply carried no choices")
@@ -1251,6 +1437,11 @@ def retry_jitter(nap: float, room: float) -> float:
 
 
 def git(args: list[str], cwd: str, timeout: float = 60.0) -> tuple[int, str]:
+    """Run one git command in a checkout and return its exit code with its combined output.
+
+    A timeout and an unexpected failure both come back as a code and a sentence rather than
+    an exception, because every caller here has to carry on either way.
+    """
     try:
         done = subprocess.run(
             ["git"] + args,
@@ -1329,6 +1520,13 @@ class CheckoutSnapshot:
     failure, rather than a later claim that a partial reset restored it.
     """
     def __init__(self, root: str, budget: float = PRELOCATE_BUDGET_SEC):
+        """Take a copy of the checkout as it stands, so it can be put back exactly.
+
+        Every tracked and untracked entry is recorded with its mode and digest and
+        copied aside under a private directory, within the time allowed. A copy that
+        cannot be completed is no copy at all, so the caller is told rather than left
+        with half of one.
+        """
         self.root = os.path.realpath(root)
         self.owner = None
         self.entries = {}
@@ -1364,10 +1562,14 @@ class CheckoutSnapshot:
 
     @staticmethod
     def check_time(deadline):
+        """Stop the work when it has run past its time allowance."""
         if time.monotonic() >= deadline:
             raise TimeoutError("checkout preservation exceeded its time allowance")
 
     def inventory(self, deadline):
+        """Every entry under the checkout, in a stable order, with its own stat and not a symlink's
+        target.
+        """
         def walk(directory, relative=""):
             self.check_time(deadline)
             with os.scandir(directory) as stream:
@@ -1385,6 +1587,9 @@ class CheckoutSnapshot:
 
     @classmethod
     def copy(cls, source, destination, deadline):
+        """Copy one regular file aside and return its digest, refusing anything that is not a
+        regular file.
+        """
         digest = hashlib.sha256()
         fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         with os.fdopen(fd, "rb") as stream:
@@ -1407,6 +1612,8 @@ class CheckoutSnapshot:
 
     @staticmethod
     def remove(path):
+        """Remove one entry, a symlink or file by unlinking it and a real directory by emptying it.
+        """
         if os.path.islink(path) or not os.path.isdir(path):
             os.unlink(path)
         else:
@@ -1415,6 +1622,12 @@ class CheckoutSnapshot:
     def restore(self, deadline):
         # Recreate original directories before touching their children. A
         # replaced parent symlink must never redirect restoration elsewhere.
+        """Put the checkout back to the recorded state, parents before children.
+
+        Directories are recreated first so a replaced parent symlink cannot redirect the
+        rest of the work, then anything added is removed and anything changed is written
+        back from the copy.
+        """
         for relative, mode in sorted(self.directories.items(), key=lambda row: row[0].count(os.sep)):
             self.check_time(deadline)
             path = os.path.join(self.root, relative)
@@ -1467,12 +1680,23 @@ class CheckoutSnapshot:
             raise OSError("original nontracked checkout state was not restored exactly")
 
     def close(self):
+        """Release the private directory the copy was kept in."""
         if self.owner is not None:
             self.owner.cleanup()
             self.owner = None
 
 class Tree:
+    """The checkout this run works in, and the only place its answer comes from.
+
+    Every read and write goes through here so nothing can reach outside the repository, and
+    the answer is always the difference between the base commit and the tree as it stands. A
+    copy of the original checkout is kept at the start so the tree can be put back byte for
+    byte before the answer is handed over.
+    """
     def __init__(self, root: str, statement: str = "") -> None:
+        """Open a checkout: find its base commit, note what was already untracked, and copy it
+        aside.
+        """
         self.root = root
         self.statement = statement
         code, out = git(["rev-parse", "HEAD"], root, 30)
@@ -1481,11 +1705,14 @@ class Tree:
         self.original_snapshot = CheckoutSnapshot(root)
 
     def _untracked(self, budget: float = 30.0) -> set | None:
+        """The untracked paths git lists, or None when the listing itself did not finish."""
         code, out = git(["ls-files", "--others", "--exclude-standard", "-z"],
                         self.root, max(1.0, budget))
         return {p for p in out.split("\0") if p} if code == 0 else None
 
     def absolute(self, path: str) -> str:
+        """A path inside the checkout as an absolute one, refusing anything that would escape it.
+        """
         if len(path) > PATH_CHARS_MAX:
             # Said here rather than by the operating system, whose refusal
             # quotes the whole path back and would fill the transcript with it.
@@ -1498,6 +1725,8 @@ class Tree:
         return joined
 
     def read(self, path: str) -> str:
+        """One file's text, with undecodable bytes replaced so a stray byte cannot end the run.
+        """
         full = self.absolute(path)
         if not os.path.isfile(full):
             raise ToolFault("no such file: %s" % path)
@@ -1537,6 +1766,12 @@ class Tree:
     def write(self, path: str, text: str) -> None:
         # Validate bytes before touching a destination. Replacing a complete
         # sibling file also avoids writing through hardlinks to other files.
+        """Write one file in place, preserving its mode and never writing through a link.
+
+        The bytes are validated first and a complete sibling file is swapped in, so a
+        hardlink to another file cannot be edited through and a half-written file cannot
+        be left behind.
+        """
         payload = text.encode("utf-8", "surrogateescape")
         full = os.path.realpath(self.inside(path))
         parent = os.path.dirname(full) or self.root
@@ -1586,6 +1821,7 @@ class Tree:
                     pass
 
     def changed_paths(self, budget: float = 15.0) -> list[str]:
+        """The paths that differ from the base commit."""
         if not self.base:
             return []
         code, out = git(["-c", "core.filemode=true", "diff", "--name-only", "-z", self.base],
@@ -1595,12 +1831,20 @@ class Tree:
         return [path for path in out.split("\0") if path]
 
     def at_base(self, path: str, budget: float = 15.0) -> str:
+        """One file's text as the base commit has it, for comparing against the tree as it stands.
+        """
         code, out = git(["show", "%s:%s" % (self.base, path)], self.root, budget)
         if code != 0:
             raise ToolFault("could not read %s as it was: %s" % (path, out.strip()[:200]))
         return out
 
     def generated_exclusions(self, budget: float = 15.0) -> list[str]:
+        """Pathspecs that keep build by-products out of the answer unless the task asked for them.
+
+        Anything that appeared under a vendor, dist, target or node_modules directory
+        during the run is a by-product of running the project, not a change this run
+        chose to make.
+        """
         code, listing = git(["ls-tree", "-r", "--name-only", "-z", self.base], self.root, budget)
         if code:
             return []
@@ -1720,6 +1964,13 @@ class Tree:
     def diff(self, budget: float = 60.0, failed: list | None = None) -> str:
         # `failed`, when given, collects every step that did not complete, so a
         # caller can tell an empty diff from one git could not produce.
+        """The answer: the difference between the base commit and the tree as it stands.
+
+        Intents to add are marked first so a new file is included, by-products are
+        excluded, and binary content is handled section by section. Every step that did
+        not finish is collected into `failed`, so a caller can tell an empty answer from
+        one git could not produce.
+        """
         deadline = time.monotonic() + budget
 
         def left(floor: float = 1.0) -> float:
@@ -1790,6 +2041,9 @@ class Tree:
         return 0, exact
 
     def binary_sections(self, args: list, raw: bytes, left) -> str | None:
+        """The diff with binary files handled one section at a time, or None when the listing
+        failed.
+        """
         listing = ["-c", "core.filemode=true", "-c", "core.quotePath=false",
                    "diff", "--name-only", "-z"] + args[3:]
         code, names = git_bytes(listing, self.root, left())
@@ -1850,6 +2104,9 @@ class Tree:
         return again.decode("utf-8")
 
     def applies(self, patch: str, budget: float = 30.0) -> bool | None:
+        """Does this patch apply to the original checkout? None when the question could not be
+        answered.
+        """
         if not patch.strip():
             say("[PATCH] empty: the run finished without changing a line")
             return False
@@ -1880,6 +2137,11 @@ class Tree:
         return False
 
     def salvage(self, patch: str, budget: float = 45.0) -> str:
+        """The largest part of a patch that still applies, when the whole of it does not.
+
+        A patch is split by file and each section is tried on its own, so one unusable
+        section costs its own file rather than the whole answer.
+        """
         deadline = time.time() + max(1.0, budget)
         parts = split_by_file(patch)
         if len(parts) < 2:
@@ -1915,6 +2177,7 @@ class Tree:
         return joined
 
     def applies_quietly(self, patch: str, budget: float) -> bool | None:
+        """Does one patch section apply, with nothing said about it either way?"""
         if not patch.strip():
             return False
         try:
@@ -1938,6 +2201,9 @@ class Tree:
         return code == 0
 
     def _unlock(self, said: str) -> bool:
+        """Remove an index lock a stopped process left behind, and say whether that was the
+        problem.
+        """
         if "index.lock" not in (said or ""):
             return False
         try:
@@ -1948,6 +2214,11 @@ class Tree:
         return True
 
     def restore(self, budget: float = 60.0) -> bool:
+        """Put the checkout back to the base commit and remove what this run added.
+
+        True only when the tree is confirmed back as it was, because the answer is read
+        against it afterwards.
+        """
         deadline = time.monotonic() + budget
         args = (["reset", "--hard", self.base] if self.base
                 else ["checkout", "--", "."])
@@ -1987,11 +2258,13 @@ class Tree:
         return vouched
 
     def close(self):
+        """Release the copy of the original checkout."""
         snapshot = getattr(self, "original_snapshot", None)
         if snapshot is not None:
             snapshot.close()
 
 class ToolFault(Exception):
+    """A tool was asked for something it will not do, with the reason the model is told."""
     pass
 
 CLIP_NOTE = "\n... [%d characters of %s elided] ...\n"
@@ -2012,6 +2285,8 @@ def sig1(number: str) -> str:
 
 
 def sig1_float(value: float) -> float:
+    """A number rounded to one significant figure, so a timing in the log cannot be read as exact.
+    """
     return float(sig1("%.6f" % value))
 
 
@@ -2056,6 +2331,7 @@ def steady(text: str) -> str:
 
 
 def clip(text: str, cap: int, label: str = "output") -> str:
+    """Text cut to a cap, with a note in the middle saying how much was left out and of what."""
     if len(text) <= cap:
         return text
     keep = cap
@@ -2073,6 +2349,8 @@ SHELL_REPORT_CAP = 120
 STILL_RUNNING = "[still running]"
 
 def report_shell(job: "Shell", out: str) -> None:
+    """Log one command's duration, output size, the command itself and its last meaningful line.
+    """
     target = getattr(job, "scrub_target", None) or getattr(job, "sql_target", None)
     if target is not None:
         out = scrub(out, target)
@@ -2092,6 +2370,8 @@ FINDING_CONCISE = re.compile(r"^(\S+?):(\d+):\d+:\s", re.M)
 HUNK_HEAD = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,(\d+))? @@")
 
 def path_tail(name: str, root: str = "") -> str:
+    """A path as the repository names it: no root prefix, no leading dot segment, forward slashes.
+    """
     text = str(name or "").replace("\\", "/")
     base = str(root or "").replace("\\", "/").rstrip("/")
     if base and text.startswith(base + "/"):
@@ -2101,6 +2381,7 @@ def path_tail(name: str, root: str = "") -> str:
     return text
 
 def findings_from_text(out: str, root: str = "") -> dict:
+    """The file and line numbers a checker reported, read from its plain output."""
     text = str(out or "")
     rows: dict = {}
     for pattern in (FINDING_ARROW, FINDING_CONCISE):
@@ -2116,6 +2397,7 @@ def findings_from_text(out: str, root: str = "") -> dict:
     return findings_from_json(text, root)
 
 def findings_from_json(text: str, root: str = "") -> dict:
+    """The file and line numbers a checker reported, read from its JSON output."""
     try:
         items = json.loads(text or "")
     except (TypeError, ValueError):
@@ -2135,6 +2417,7 @@ def findings_from_json(text: str, root: str = "") -> dict:
     return out
 
 def split_by_file(patch: str) -> list[str]:
+    """A patch split into one section per file, each starting at its own diff header."""
     out: list[str] = []
     current: list[str] = []
     for line in (patch or "").splitlines(keepends=True):
@@ -2156,6 +2439,7 @@ ENVELOPE_JUNK_ENDS = (".pyc", ".pyo", ".pyd", ".orig", ".rej", ".bak", ".swp",
 ENVELOPE_JUNK_NAMES = (".DS_Store", ".coverage", "nohup.out")
 
 def section_path(section: str) -> str:
+    """The path one patch section changes, taken from its header."""
     head = section.split("\n", 1)[0]
     if not head.startswith("diff --git "):
         return ""
@@ -2166,6 +2450,7 @@ def section_path(section: str) -> str:
     return body.strip().strip('"')
 
 def junk_path(path: str) -> bool:
+    """Is this path a by-product of running the project rather than part of an answer?"""
     parts = [part for part in path.split("/") if part]
     if not parts:
         return False
@@ -2353,6 +2638,12 @@ def operation_refusal(operation: str, paths, statement: str, root: str = "") -> 
     return ""
 
 def operation_violation(paths, operations, statement: str, root: str = "") -> str:
+    """Why a change to these paths is outside what the task allows, in the task's own words, or
+    empty.
+
+    The statement's own path boundaries are checked first, then each operation the change
+    performs, so the reason given back always quotes the clause that forbids it.
+    """
     paths = tuple(operation_path(path, root) for path in paths)
     for clause, edges in path_boundaries(statement, root):
         outside = [path for path in paths if not any(
@@ -2388,11 +2679,17 @@ def operation_violation(paths, operations, statement: str, root: str = "") -> st
     return ""
 
 def envelope_reason(section: str, allowed=(), bounds=(), statement: str = "", root: str = "") -> str:
+    """Why one patch section lies outside what the task allows, or empty when it does not."""
     paths, operations = section_operations(section)
     # Modes can be removed without losing the otherwise permitted content.
     return operation_violation(paths, operations - {"mode"}, statement, root)
 
 def demoded(section: str, statement: str = "", root: str = "") -> tuple[str, str]:
+    """The section with a prohibited mode change removed, and what was removed.
+
+    A mode change can be dropped without losing the content of the edit, so a file-
+    permission change the task forbids does not cost the edit itself.
+    """
     paths, operations = section_operations(section)
     clause = operation_refusal("mode", paths, statement, root) if "mode" in operations else ""
     if not clause:
@@ -2442,7 +2739,29 @@ def byproduct_trim(patch: str, beacon: "Beacon", statement: str = "",
                  % (len(dropped), ", ".join(dropped[:3])))
     return joined
 
+def envelope_or_whole(patch: str, beacon: "Beacon", statement: str = "", root: str = "") -> str:
+    """The envelope trim, unless it would leave nothing.
+
+    A change that lands outside the boundary this run read from the statement
+    still goes out whole: the reading may be wrong, and nothing is no answer.
+    """
+    if not (PATCH_ENVELOPE and patch.strip()):
+        return patch
+    trimmed = envelope_trim(patch, beacon, statement, root)
+    if trimmed.strip():
+        return trimmed
+    try:
+        beacon.fired("the envelope would leave nothing; the answer goes out whole")
+    except BaseException as error:
+        say("[ENVELOPE] the note was not written: %s" % type(error).__name__)
+    return patch
+
 def envelope_trim(patch: str, beacon: "Beacon", statement: str = "", root: str = "") -> str:
+    """The answer with every section the task's own words put out of bounds removed.
+
+    Each dropped section is reported with the clause that forbade it, so a boundary this run
+    read wrongly can be seen in the log rather than guessed at.
+    """
     if not RIDGES_SCOPE_FOLLOWS_STATEMENT:
         beacon.skipped("statement filtering is disabled")
         return patch
@@ -2481,9 +2800,13 @@ def envelope_trim(patch: str, beacon: "Beacon", statement: str = "", root: str =
 # one method states a rule the task never gave.
 
 def contract_readable(path: str) -> bool:
+    """Can this run read the contract of this file, which today means a Python source file?"""
     return path.endswith(".py")
 
 def python_functions(text: str) -> tuple[dict, dict, dict]:
+    """Which function or class each line of a Python file belongs to, with their heads and first
+    lines.
+    """
     import ast
     lines = text.splitlines(keepends=True)
     owner: dict = {}
@@ -2508,6 +2831,8 @@ def python_functions(text: str) -> tuple[dict, dict, dict]:
     return owner, heads, first
 
 def changed_line_numbers(before: str, after: str) -> tuple[set, set]:
+    """The line numbers that differ between two texts, as (lines in the old, lines in the new).
+    """
     import difflib
     old, new = before.splitlines(), after.splitlines()
     was, now = set(), set()
@@ -2647,6 +2972,7 @@ def contract_violations(path: str, before: str, after: str,
     return hard, soft
 
 def patch_touched_lines(patch: str) -> dict:
+    """The line numbers each file's section of a patch changes, keyed by path."""
     out: dict = {}
     where = ""
     came_from = ""
@@ -2690,6 +3016,7 @@ def patch_touched_lines(patch: str) -> dict:
     return out
 
 def _diff_side(name: str, prefix: str) -> str:
+    """One side of a diff header as a repository path, or empty when that side is absent."""
     text = name.strip()
     if text == "/dev/null" or not text:
         return ""
@@ -2698,6 +3025,7 @@ def _diff_side(name: str, prefix: str) -> str:
     return path_tail(text)
 
 def finding_distances(findings: dict, touched: dict) -> list:
+    """For every changed line, how far it is from the nearest line a checker reported."""
     out = []
     for where in sorted(touched):
         rows = findings.get(where)
@@ -2708,6 +3036,11 @@ def finding_distances(findings: dict, touched: dict) -> list:
     return out
 
 def finding_record(findings: dict, touched: dict) -> str:
+    """A sentence on how the change lines up with what a checker reported, for the log.
+
+    A change far from everything reported, or in files nothing reported, is worth seeing: it
+    may be right, and it may be work the task did not ask for.
+    """
     reported = sum(len(rows) for rows in findings.values())
     changed = sum(len(rows) for rows in touched.values())
     silent = sum(1 for where in touched if where not in findings)
@@ -2723,13 +3056,21 @@ def finding_record(findings: dict, touched: dict) -> str:
                sum(1 for gap in gaps if gap > 40), len(gaps), silent))
 
 class FindingMap:
+    """What the project's own checkers reported during this run, by file and line.
+
+    The lines a checker names are read from its output as it goes, and compared at the end
+    with the lines the answer changes.
+    """
     def __init__(self, root: str) -> None:
+        """Start an empty record of what the checkers reported in this checkout."""
         self.root = root
         self.rows: dict = {}
         self.reads = 0
         self.beacon = Beacon("findings")
 
     def observe(self, command: str, out: str) -> None:
+        """Read one checker's output and keep the file and line numbers it reported that are new.
+        """
         text = one_line(command)
         if not FINDING_CHECK.match(text):
             return
@@ -2744,6 +3085,7 @@ class FindingMap:
                           % (text[:120], sum(len(rows) for rows in fresh.values()), len(fresh)))
 
     def report(self, patch: str) -> None:
+        """Log how the answer's changed lines line up with everything the checkers reported."""
         if not self.rows:
             self.beacon.skipped("no reading of the check was recorded")
             return
@@ -2752,6 +3094,8 @@ class FindingMap:
 _VENV_BIN = ""
 
 def venv_bin() -> str:
+    """The project's own virtual environment bin directory, found once, or empty when it has none.
+    """
     global _VENV_BIN
     if _VENV_BIN == "":
         _VENV_BIN = "-"
@@ -2763,11 +3107,16 @@ def venv_bin() -> str:
     return "" if _VENV_BIN == "-" else _VENV_BIN
 
 def repo_python() -> str:
+    """The interpreter this run is running under, which is the one the project's tools expect.
+    """
     return sys.executable or "python3"
 
 PACKAGES_AT_ONCE = 1
 
 def command_env(pack_venv: bool = True) -> dict:
+    """The environment a shell command runs in: the project's tools on the path and its own build
+    flags kept.
+    """
     env = dict(os.environ)
     if pack_venv and PACK_VENV:
         where = venv_bin()
@@ -2839,10 +3188,18 @@ def bounded_shell_output(path: str) -> str:
     return raw.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
 
 class Shell:
+    """One shell command, run in the background and read while it runs.
+
+    Output goes to a file rather than a pipe so a command that writes a great deal cannot
+    block, descendants are tracked so nothing is left running after the command is done, and
+    credentials are passed through the environment rather than the command line where they
+    would reach the process table and the log.
+    """
     counter = 0
 
     def __init__(self, command: str, cwd: str, pack_venv: bool = True,
                  hard_timeout: float | None = None, env_extra: dict | None = None) -> None:
+        """Start one command in its own process group, with its output going to a file."""
         Shell.counter += 1
         self.name = "job%d" % Shell.counter
         self.command = command
@@ -2902,6 +3259,7 @@ class Shell:
             self.watchdog.start()
 
     def _expire(self) -> None:
+        """Mark the command as having run out of time and stop it and anything it started."""
         with self.gate:
             if not self.closed and (self.process.poll() is None or self._owned()):
                 self.timed_out = True
@@ -2919,6 +3277,7 @@ class Shell:
         return code
 
     def result(self, out: str) -> str:
+        """The command's status line and its output, clipped, as the model will read it."""
         code = self.code()
         status = "running" if code is None else "exit_code=%d" % code
         if self.timed_out:
@@ -2926,6 +3285,11 @@ class Shell:
         return "[%s]\n%s" % (status, clip(steady(out), SHELL_OUTPUT_CAP, "shell output") or "(no output)")
 
     def _owned(self) -> list:
+        """The live processes this command is responsible for, by tag and by recorded start time.
+
+        A process id can be reused, so a recorded start time has to match before a
+        process is killed as this command's own.
+        """
         with self.gate:
             found = []
             tagged = set(tagged_processes(self.owner_tag))
@@ -2954,6 +3318,8 @@ class Shell:
             return found
 
     def _kill(self) -> None:
+        """Stop the command and everything it started, the process group first and strays by id.
+        """
         owned = self._owned()
         group_owned = self.process.poll() is None
         if not group_owned:
@@ -2978,6 +3344,7 @@ class Shell:
                 pass
 
     def _settle_descendants(self, timeout: float = 1.0) -> bool:
+        """Wait for every process this command started to be gone, and say whether they are."""
         with self.gate:
             until = time.monotonic() + max(0.0, timeout)
             while True:
@@ -3016,6 +3383,9 @@ class Shell:
             self.cached = cached[:cut] + text + cached[cut:]
 
     def _text(self) -> str:
+        """Everything the command has written so far, with a marker when the output could not all
+        be read.
+        """
         if self.closed:
             return self.cached or ""
         try:
@@ -3029,6 +3399,7 @@ class Shell:
                     + " captured output could not be read]" + getattr(self, "back", ""))
 
     def _tail(self, cap: int = SHELL_OUTPUT_CAP) -> str:
+        """The last of the command's output, read from the end of its file."""
         if self.closed:
             return (self.cached or "")[-cap:]
         try:
@@ -3042,6 +3413,7 @@ class Shell:
             return ""
 
     def wait(self, timeout: float) -> tuple:
+        """Wait for the command, then return whether it settled and what it wrote."""
         try:
             self.process.wait(timeout=max(1.0, timeout))
             return self._settle_descendants(), self._text()
@@ -3049,9 +3421,11 @@ class Shell:
             return False, self._text()
 
     def finished(self) -> bool:
+        """Has the command exited?"""
         return self.code() is not None
 
     def drain(self) -> str:
+        """The command's output, with a note appended while it is still running."""
         if self.code() is None:
             return self._text() + "\n" + STILL_RUNNING
         return self._text()
@@ -3410,6 +3784,7 @@ CASE_ID = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,31}\Z")
 CASE_QUOTE_MIN = 12
 
 def declared_cases() -> list[tuple[str, dict]]:
+    """The cases this run has declared, the unnamed one first when there is one."""
     return ([("", CASE)] if CASE else []) + list(NAMED_CASES.items())
 
 def case_bindings(command: str) -> dict:
@@ -3427,6 +3802,9 @@ def case_scopes(command: str) -> list:
             for name, case in declared_cases() if name in names]
 
 def workload_context(record: dict):
+    """The caller, workload and dataset a record's claims are scoped to, or None when any is
+    missing.
+    """
     scopes = record.get("case_scopes", [])
     if not scopes:
         return None
@@ -3448,6 +3826,9 @@ def case_status(record: dict, current_identity: str) -> str:
     return status
 
 def case_block(record: dict, current_identity: str) -> str:
+    """One case as the model reads it: its status, what it asserts, its evidence and where it came
+    from.
+    """
     if not record:
         return ""
     lines = [
@@ -3502,6 +3883,7 @@ def reset_checks() -> None:
     REFERENCED_READ.clear()
 
 def patch_digest(patch: str) -> str:
+    """A short digest of an answer, so the same answer can be recognised later."""
     import hashlib
     return hashlib.sha256((patch or "").encode("utf-8", "replace")).hexdigest()[:12]
 
@@ -3532,6 +3914,9 @@ def environment_identity(environment: dict) -> str:
     return hashlib.sha256(json.dumps(values, ensure_ascii=True).encode()).hexdigest()
 
 def record_command_key(record: dict) -> str:
+    """The full identity of the command a record is about, or empty when only a clipped display
+    survives.
+    """
     if record.get("command_key"):
         return record["command_key"]
     # Older in-memory records did not save a full key. A display at its cap
@@ -3557,6 +3942,8 @@ def record_context(record: dict) -> tuple:
     return context
 
 def record_exit(record: dict) -> int | None:
+    """The exit code a command record carries, from the field or from its status line, or None.
+    """
     value = record.get("exit_code")
     if isinstance(value, int) and not isinstance(value, bool):
         return value
@@ -3571,6 +3958,9 @@ def stable_record(record: dict) -> bool:
                 and record_exit(record) is not None)
 
 def usable_record(record: dict) -> bool:
+    """Is this record evidence? It must be settled, complete, exit clean and have actually run
+    something.
+    """
     return bool(stable_record(record) and record.get("evidence")
                 and completed_record_time(record) is not None
                 and record.get("output_complete", True)
@@ -3628,6 +4018,11 @@ def current_records(records: list, current: str) -> list:
     return selected
 
 def current_usable_records(records: list, current: str) -> list:
+    """The records that vouch for the source as it stands now, with ambiguous invocations left out.
+
+    Two readings of the same invocation that disagree, including ones with equal timestamps,
+    make that invocation's outcome unclear, so neither is treated as evidence.
+    """
     readings = current_records(records, current)
     # Unordered conflicting readings, including equal timestamps and delayed
     # collection, make success ambiguous for that invocation.
@@ -3655,6 +4050,7 @@ def assertion_failure(out: str) -> bool:
                           r"FAILED \(failures=[1-9]\d*(?:\)|, errors=0\))", text))
 
 def meaningful_failure(record: dict) -> bool:
+    """Did this command fail because the code is wrong, rather than because it could not run?"""
     if (not stable_record(record) or record.get("outcome") != "failed"
             or (record_exit(record) or 0) <= 0):
         return False
@@ -3896,11 +4292,18 @@ class LaneBusy(Exception):
     """Raised when a lane a command needs is held by a job still running."""
 
     def __init__(self, lane: str) -> None:
+        """Say which lane is busy, so the caller can wait on that one rather than guess."""
         super().__init__("the %s lane is busy" % lane)
         self.lane = lane
 
 class ShellPool:
+    """The background commands this run has started, and the lanes that keep them from colliding.
+
+    Commands that use the same resource, such as the project's database, share a lane so
+    only one runs at a time, and everything is stopped and reaped when the pool closes.
+    """
     def __init__(self, cwd: str) -> None:
+        """Open an empty pool of background commands for this checkout."""
         self.cwd = cwd
         self.jobs = {}
         self.lanes: dict = {}
@@ -3967,12 +4370,14 @@ class ShellPool:
             self.lanes[lane] = job
 
     def get(self, name: str) -> Shell:
+        """One background command by name, or a refusal naming what was asked for."""
         job = self.jobs.get(name)
         if job is None:
             raise ToolFault("no background job named %s" % name)
         return job
 
     def close(self) -> None:
+        """Stop and reap every command, log its last output, and run the pool's own cleanups."""
         for job in list(self.jobs.values()):
             try:
                 job._kill()
@@ -4124,6 +4529,7 @@ TOOL_SCHEMAS = [
 ]
 
 def _schema(name: str) -> dict:
+    """One tool's schema by name, for a caller that needs to read or extend it."""
     return next(t["function"] for t in TOOL_SCHEMAS if t["function"]["name"] == name)
 
 if SEARCH_LIMIT:
@@ -4682,6 +5088,9 @@ COMMAND_SEPARATOR = frozenset(("&&", "||", "|", "|&", "&", ";", ";;"))
 REDIRECT_IN_TOKEN = re.compile(r"\d*(?:>>|>|<<|<)&?")
 
 def split_redirect(token: str) -> tuple:
+    """A shell token split from a redirection stuck to it, and whether the redirection was all of
+    it.
+    """
     found = REDIRECT_IN_TOKEN.search(token)
     if not found:
         return token, False
@@ -5155,6 +5564,9 @@ _sys.meta_path.append(_Finder())
 '''
 
 def resolvable(name: str) -> bool:
+    """Can this module be imported here? An unanswerable question is treated as yes, not as
+    missing.
+    """
     try:
         import importlib.util
         return importlib.util.find_spec(name) is not None
@@ -5162,6 +5574,8 @@ def resolvable(name: str) -> bool:
         return True
 
 def missing_modules(out: str) -> list:
+    """The top-level modules an output says are missing and that really are not importable here.
+    """
     seen = []
     for name in MISSING_MODULE.findall(out or ""):
         if "." in name:
@@ -5171,6 +5585,7 @@ def missing_modules(out: str) -> list:
     return seen
 
 def missing_dists(out: str) -> list:
+    """The distributions an output says are missing, by name."""
     seen = []
     for name in MISSING_DIST.findall(out or ""):
         if name not in seen and re.fullmatch(r"[A-Za-z0-9._-]+", name):
@@ -5178,6 +5593,9 @@ def missing_dists(out: str) -> list:
     return seen
 
 def inside(path: str, root: str) -> bool:
+    """Is this path inside this root? A question that cannot be answered is treated as yes, not as
+    an escape.
+    """
     try:
         path, root = os.path.realpath(path), os.path.realpath(root)
         if (os.path.splitdrive(path)[0].lower()
@@ -5188,6 +5606,7 @@ def inside(path: str, root: str) -> bool:
         return True
 
 def write_dist_records(names: list, where: str) -> list:
+    """Write minimal metadata for named distributions so a version check can find them."""
     made = []
     for name in names:
         try:
@@ -5202,6 +5621,7 @@ def write_dist_records(names: list, where: str) -> list:
     return made
 
 def write_shims(names: list, where: str) -> list:
+    """Write importable stand-ins for named modules, and return the ones written."""
     made = []
     for name in names:
         try:
@@ -5402,7 +5822,7 @@ GREEN_RESTORE_MIN_SEC = 90.0
 # back and the problem is worked a second time from a clean transcript. The
 # two answers are then run against the same checks and expectations; the one
 # that passes more goes out; without a demonstrated difference the first stays.
-SECOND_DERIVATION = flag("RIDGES_SECOND_DERIVATION")
+SECOND_DERIVATION = flag("RIDGES_SECOND_DERIVATION", "0")
 SECOND_MIN_SEC = 700.0
 SECOND_MIN_USD = 0.08
 SECOND_MAX_SPENT_USD = 0.06
@@ -5413,7 +5833,7 @@ PICK_EXPECTATIONS_MAX = 6
 # Below this much room the two answers are not compared: the first stands.
 PICK_MIN_SEC = 60.0
 # A third derivation settles two answers that differ but tie on every check.
-THIRD_DERIVATION = flag("RIDGES_THIRD_DERIVATION")
+THIRD_DERIVATION = flag("RIDGES_THIRD_DERIVATION", "0")
 THIRD_MAX_SPENT_USD = 0.12
 # --- A required expectation (v53) ---
 # On a task that lists what the rows must be and configures a database, the
@@ -5536,6 +5956,7 @@ def cell_key(cell) -> str:
 
 
 def show_row(row: list) -> str:
+    """One row of values as the model reads it."""
     return "[" + ", ".join(str(cell) for cell in row) + "]"
 
 
@@ -5611,6 +6032,9 @@ if GREEN_MEMORY:
 
 
 def review_tools() -> list[dict]:
+    """The tools the second reader is offered: read-only, plus the editor when it may correct the
+    change.
+    """
     names = set(REVIEW_TOOL_NAMES) | ({"edit"} if CLOSER_SEAT else set())
     return [s for s in TOOL_SCHEMAS if s["function"]["name"] in names] + REVIEW_EXTRA_TOOLS
 
@@ -5666,6 +6090,9 @@ def grounded_findings(statement: str, tree, findings: object) -> tuple[list, lis
 
 
 def review_findings_text(findings: list) -> str:
+    """The second reader's anchored doubts as the driver reads them, each quoting the task and the
+    code.
+    """
     parts = []
     for number, finding in enumerate(findings, 1):
         parts.append("%d. The task says: \"%s\"\n   In %s: \"%s\"\n   Falls short for: %s\n"
@@ -5788,12 +6215,14 @@ def run_review(statement: str, tree, pool, allowance, warden, beacon: "Beacon",
 
 
 def length_class(text: str) -> str:
+    """How long an answer is, in words rather than numbers, for a sentence about it."""
     size = len(text or "")
     if size < CONSULT_ANSWER_SHORT:
         return "a short"
     return "a middling" if size < CONSULT_ANSWER_LONG else "a long"
 
 def statement_of(warden) -> str:
+    """The task statement this run is working to, or empty when there is none."""
     return (warden.statement if warden is not None else "") or ""
 
 CONSULT_BRIEF = """Review only the supplied task, patch and observed command results. You cannot edit files or run tools. Identify a concrete mismatch with an explicit task requirement or an assumption visible in the changed code. Cite the relevant requirement or changed line for each concern; do not supply a predefined checklist or infer requirements from the task's topic.
@@ -5852,23 +6281,29 @@ class QuietBeacon(Beacon):
     """A Beacon that keeps its lines rather than printing them."""
 
     def __init__(self, slug: str) -> None:
+        """Open a beacon that keeps its lines instead of printing them."""
         super().__init__(slug)
         self.lines: list[str] = []
         self.fired_details: list[str] = []
 
     def skipped(self, reason: str) -> None:
+        """Keep the reason this slot did nothing, for a caller that will decide whether to say it.
+        """
         self.lines.append("skipped: " + reason)
 
     def fired(self, detail: str) -> None:
+        """Keep what this slot did, and its detail, without printing either."""
         self.lines.append(detail[:400])
         self.fired_details.append(detail[:400])
 
     def artefact(self, when: str, blob: str) -> str:
+        """Keep the digest and size of a text about to change, and return the digest."""
         digest = hashlib.sha256((blob or "").encode("utf-8", "replace")).hexdigest()[:8]
         self.lines.append("%s %s %dB" % (when, digest, len(blob or "")))
         return digest
 
     def outcome(self, before_digest: str, after: str) -> None:
+        """Keep the digest and size afterwards, and whether anything changed."""
         digest = hashlib.sha256((after or "").encode("utf-8", "replace")).hexdigest()[:8]
         self.lines.append("after %s %dB changed=%s" % (digest, len(after or ""),
                                                       "yes" if digest != before_digest else "no"))
@@ -5895,13 +6330,11 @@ def empty_answer(tree, statement: str, allowance) -> str:
             return EMPTY_ANSWER_NO_CHANGE
         root = getattr(tree, "root", "")
         patch = byproduct_trim(patch, QuietBeacon("byproduct"), statement, root)
-        envelope = QuietBeacon("envelope")
-        if PATCH_ENVELOPE and patch.strip():
-            patch = envelope_trim(patch, envelope, statement, root)
-        if patch.strip():
-            return ""
-        return EMPTY_ANSWER_ALL_LEFT_OUT % (envelope.fired_details[-1] if envelope.fired_details
-                                            else "the statement's limits")
+        if not patch.strip():
+            return EMPTY_ANSWER_NO_CHANGE
+        # The envelope never empties an answer: what it would leave out goes out whole.
+        patch = envelope_or_whole(patch, QuietBeacon("envelope"), statement, root)
+        return "" if patch.strip() else EMPTY_ANSWER_NO_CHANGE
     except Exception:
         return ""
 
@@ -5924,6 +6357,11 @@ def empty_answer_note(kit) -> str:
             "Call submit again once the patch holds your change." % (why, hint))
 
 def bullet_runs(text: str) -> list[list[str]]:
+    """The bulleted lists in a text, each as its own run of items, with fenced blocks left out.
+
+    A list inside a fenced block is example text rather than a requirement, and an indented
+    line continues the item above it.
+    """
     runs: list[list[str]] = []
     current: list[str] = []
     fenced = False
@@ -5950,6 +6388,7 @@ def bullet_runs(text: str) -> list[list[str]]:
     return [[item for item in run if item] for run in runs]
 
 def stated_requirements(text: str) -> list[str]:
+    """Every bulleted requirement the statement lists, in order."""
     return [item for run in bullet_runs(text) for item in run]
 
 LEDGER_GUARD = re.compile(
@@ -5958,9 +6397,14 @@ LEDGER_GUARD = re.compile(
     r"never|leave|leaves|untouched)\b", re.I)
 
 def wants_an_edit(item: str) -> bool:
+    """Does this requirement ask for a change, rather than asking that something stay as it is?
+    """
     return not LEDGER_GUARD.search(item or "")
 
 def read_back(items: list[str]) -> str:
+    """The request to point each extracted requirement at the code that satisfies it before handing
+    in.
+    """
     lines = "\n".join("  %d. %s" % (n + 1, item) for n, item in enumerate(items))
     return ("Before this goes in, compare these extracted clauses with the "
             "current task, which remains authoritative:\n%s\n"
@@ -5972,11 +6416,15 @@ def read_back(items: list[str]) -> str:
             "after this review." % lines)
 
 def importable(path: str) -> bool:
+    """Is this path a Python source file this run could import?"""
     return any(path.endswith(suffix) for suffix in importlib.machinery.SOURCE_SUFFIXES)
 
 NESTED_SOURCE = "src"
 
 def package_roots(root: str) -> list[str]:
+    """Where this project's packages live: the checkout, and a nested source directory when it has
+    one.
+    """
     nested = os.path.join(root, NESTED_SOURCE)
     return [root, nested] if os.path.isdir(nested) else [root]
 
@@ -6019,6 +6467,9 @@ def check_command(argv: list) -> bool:
     return True
 
 def check_commands(statement: str) -> list:
+    """The commands the statement names that report findings rather than running the project's
+    tests.
+    """
     return [argv for argv in command_lines(statement) if check_command(argv)]
 
 def check_targets(argv: list) -> list:
@@ -6262,6 +6713,9 @@ def declared_file(statement: str, root: str) -> str | None:
     return named[0] if len(named) == 1 else None
 
 def named_literals(statement: str) -> list[str]:
+    """The short backticked names the statement mentions, which are identifiers rather than
+    commands.
+    """
     out = []
     for raw in dict.fromkeys(re.findall(r"`([^`\n]{1,40})`", statement or "")):
         if (" " in raw or "/" in raw or "\\" in raw
@@ -6283,6 +6737,7 @@ HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+", re.M)
 ROW_LINE_RE = re.compile(r"^line (\d+):")
 
 def touched_lines(diff: str) -> list[tuple[int, int]]:
+    """The line spans a diff changes, as (first, last) pairs read from its hunk headers."""
     spans = []
     for start, length in HUNK_RE.findall(diff or ""):
         first = int(start)
@@ -6294,6 +6749,7 @@ MUTATION_SCAN_MAX_CHARS = 1_000_000
 TEST_MODULE_RE = re.compile(r"^(?:test_.*|.*_test)\.py$")
 
 def _module_level_imports(path: str) -> set[str]:
+    """The top-level module names a Python file imports at module level."""
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as handle:
             source = handle.read(MUTATION_SCAN_MAX_CHARS)
@@ -6309,6 +6765,8 @@ def _module_level_imports(path: str) -> set[str]:
     return names
 
 def _provides(base: str, name: str) -> bool:
+    """Does this directory provide that module, as a file, a package or a directory of sources?
+    """
     if os.path.isfile(os.path.join(base, name + ".py")):
         return True
     here = os.path.join(base, name)
@@ -6326,6 +6784,7 @@ def _provides(base: str, name: str) -> bool:
     return any(_is_extension_of(base, entry, name) for entry in entries)
 
 def _is_extension_of(base: str, entry: str, name: str) -> bool:
+    """Is this directory entry a compiled extension for that module name?"""
     for suffix in (".so", ".pyd", ".dylib"):
         if not entry.endswith(suffix) or not entry.startswith(name):
             continue
@@ -6337,6 +6796,7 @@ def _is_extension_of(base: str, entry: str, name: str) -> bool:
     return False
 
 def _absent(root: str, names: set[str]) -> set[str]:
+    """Which of these module names the project does not provide and cannot be imported here."""
     missing = set()
     roots = package_roots(root)
     for name in names:
@@ -6353,6 +6813,13 @@ def _absent(root: str, names: set[str]) -> set[str]:
     return missing
 
 def readable_scope(root: str, scope: list[str]) -> tuple[list[str], str]:
+    """The part of a test scope this run can actually read, and a sentence on what it had to leave
+    out.
+
+    A file that will not parse, one that imports something absent, and one too large to scan
+    are each dropped for a stated reason, so the scope that remains is one the run can
+    reason about.
+    """
     if not scope:
         return scope, ""
     kept: list[str] = []
@@ -6432,6 +6899,9 @@ def readable_scope(root: str, scope: list[str]) -> tuple[list[str], str]:
     return kept, note
 
 def declared_trace(statement: str, root: str) -> str:
+    """A sentence on which of the statement's named files were kept in scope and which were
+    dropped.
+    """
     argvs = check_commands(statement)
     seen = dropped = existed = 0
     for argv in argvs:
@@ -6475,6 +6945,7 @@ RUNNER_SHORT_FLAGS = frozenset("qvxslh")
 RUNNER_UNMODELLED = re.compile(r"[$`(){}<>*?\[\]!~]")
 
 def stated_test_scope(statement: str, root: str) -> list[str]:
+    """The paths the statement's own test command runs, as this run reads that command."""
     found: list[str] = []
     for block in statement_command_blocks(statement):
         for line in logical_lines(block or ""):
@@ -6496,6 +6967,7 @@ def stated_test_scope(statement: str, root: str) -> list[str]:
     return sorted(set(found))
 
 def _stated_path(token: str, root: str) -> tuple[str, str]:
+    """One token of a test command as a path, or a refusal saying why it is not one."""
     token = token.split("::", 1)[0]
     if not token:
         return ("refuse", "a selector with no file in front of it")
@@ -6512,6 +6984,7 @@ def _stated_path(token: str, root: str) -> tuple[str, str]:
     return ("target", os.path.normpath(os.path.relpath(candidate, here)))
 
 def _stated_targets(argv: list, root: str) -> list[str]:
+    """The file arguments of a recognised test runner command, with its options skipped."""
     for head in TEST_RUNNER_HEADS:
         if len(argv) > len(head) and tuple(argv[:len(head)]) == head:
             rest = argv[len(head):]
@@ -6549,6 +7022,7 @@ def _stated_targets(argv: list, root: str) -> list[str]:
     return [] if takes_value else out
 
 def suite_scope(root: str, declared: str | None, specific: bool = False) -> list[str]:
+    """The test files that cover the named file, by the project's own naming conventions."""
     if not declared:
         return []
     parts = declared.split("/")
@@ -6593,6 +7067,7 @@ def suite_scope(root: str, declared: str | None, specific: bool = False) -> list
 DIFF_TRIVIAL = re.compile(r"^[\s)\]}:,]*$")
 
 def patch_shape(patch: str) -> str:
+    """A sentence describing an answer by shape: how many files, hunks and lines it changes."""
     files = hunks = 0
     added: list = []
     removed: list = []
@@ -6722,6 +7197,7 @@ def definition_preservation_clause(statement: str, definition: str) -> str:
 
 
 def suppression_prohibition_clause(statement: str, path: str = "", root: str = "") -> str:
+    """The clause forbidding suppression comments, when the statement has one for this path."""
     for clause in instruction_clauses(statement):
         paths = operation_literals(clause)
         if path and paths and not any(path_within(operation_path(path, root),
@@ -6748,6 +7224,8 @@ def suppression_comments(source: str) -> collections.Counter:
 
 
 def visible_definitions(source: str) -> list[str]:
+    """The names a module defines for its callers, so a change that removes one can be noticed.
+    """
     try:
         tree = ast.parse(source)
     except SyntaxError:
@@ -6771,6 +7249,8 @@ def visible_definitions(source: str) -> list[str]:
     return sorted(found)
 
 def outline_source(source: str) -> list[str]:
+    """A file's classes and functions as an indented outline, for reading without the whole text.
+    """
     rows: list[tuple[int, int, int, str]] = []
 
     def walk(node: ast.AST, depth: int) -> None:
@@ -6975,6 +7455,7 @@ def instruction_clauses(statement: str, *, with_lines: bool = False, reflow: boo
     return parts
 
 def stated_methods(statement: str) -> list[tuple[str, str]]:
+    """The (class, method) pairs the statement confines the change to, as it names them."""
     text = " ".join(part for part in instruction_clauses(statement)
                     if not FENCE_FORBIDS.search(part))
     qualified = [(holder, name) for holder, name in FENCE_METHOD.findall(text)]
@@ -7030,6 +7511,9 @@ def refusal_targets(clause: str, names) -> set:
     return found
 
 def fence_path(path: str, root: str = "") -> str:
+    """A path as the statement and the diff both name it: no root, no leading dot, no a/ or b/
+    prefix.
+    """
     path = path.replace("\\", "/")
     root = os.path.normpath(root).replace("\\", "/") if root else ""
     if root and path.startswith(root + "/"):
@@ -7054,6 +7538,7 @@ def stated_file(statement: str, root: str = "") -> str | None:
     return paths.pop() if len(paths) == 1 else None
 
 def method_bounds(source: str, holder: str, name: str) -> tuple[int, int] | None:
+    """The first and last line of a named method, but only when it resolves exactly once."""
     try:
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
@@ -7075,6 +7560,9 @@ def method_bounds(source: str, holder: str, name: str) -> tuple[int, int] | None
     return found[0] if len(found) == 1 else None
 
 def fenced_region(source: str, wanted: list) -> tuple[str, int, int] | None:
+    """The one method the statement's words resolve to, with its line span, or None when it is
+    ambiguous.
+    """
     hits = []
     for holder, name in wanted:
         found = method_bounds(source, holder, name)
@@ -7166,6 +7654,7 @@ def method_clause(statement: str) -> str:
     return scope_clause(statement, METHOD_RESTRICTION)
 
 def statement_bounded(statement: str) -> bool:
+    """Does the statement confine the change to something, rather than leaving it open?"""
     return bool(scope_clause(statement))
 
 def statement_method_bounded(statement: str) -> bool:
@@ -7583,6 +8072,11 @@ def effect_calls(tree, kinds, *, provenance: bool = False) -> list:
 
 
 def project_contract(root: str, statement: str = "", path: str = "") -> tuple[str, str]:
+    """What language this project is and the command it uses for its own checks.
+
+    Read from the statement's own commands first and from the files in the checkout second,
+    so a project this run does not recognise still gets its own runner rather than a guess.
+    """
     declared_languages = set()
     for block in statement_command_blocks(statement):
         try:
@@ -7644,6 +8138,7 @@ STATED_RUNNER_TOOLS = frozenset((
 STATED_RUNNER_WORDS = frozenset(("test", "tests", "rspec", "phpunit", "ctest"))
 
 def stated_command_words(line: str) -> list:
+    """One command line split into words the way a shell would, keeping quoted text together."""
     quote = ""
     escaped = False
     for index, char in enumerate(line):
@@ -7670,6 +8165,11 @@ def stated_command_words(line: str) -> list:
         return []
 
 def stated_check(argv: list) -> bool:
+    """Is this argv a check this run may run on the project's behalf?
+
+    An environment prefix and a wrapper such as a package runner are looked through to the
+    real runner, because what matters is the program that ends up running.
+    """
     if not argv:
         return False
     tool = os.path.basename(argv[0])
@@ -7790,6 +8290,7 @@ def render_word(word: str) -> str:
     return shlex.quote(word)
 
 def render_segments(segments: list) -> str:
+    """Command segments written back as one line, joined the way the statement joined them."""
     return " && ".join(" ".join(render_word(word) for word in segment)
                        for segment in segments)
 
@@ -7816,6 +8317,11 @@ def bare_commands(statement: str) -> list[str]:
 
 
 def stated_runner(statement: str, root: str = "") -> str:
+    """The command the statement says to run before finishing, as this run will run it.
+
+    A command this run cannot model is reported in the log rather than run, so nothing is
+    executed on a guess at its meaning.
+    """
     unsupported = []
     for block in statement_command_blocks(statement) + bare_commands(statement):
         for line in logical_lines(block or ""):
@@ -7830,6 +8336,8 @@ def stated_runner(statement: str, root: str = "") -> str:
     return ""
 
 def native_import_lines(source: str, language: str) -> set:
+    """The import lines of a file in a language other than Python, by that language's own syntax.
+    """
     starts = {
         "go": r'^\s*import\s+(?:\(|(?:[\w.]+\s+)?["`])',
         "node": r'^\s*import\s+(?!\()[\w*{\'\"]',
@@ -7863,6 +8371,7 @@ def native_import_lines(source: str, language: str) -> set:
     return found
 
 def import_lines(source: str, language: str | None = None) -> set:
+    """The line numbers of a file's imports, so a change that touches them can be noticed."""
     if RIDGES_SCOPE_FOLLOWS_STATEMENT and language not in (None, "python"):
         return native_import_lines(source, language)
     try:
@@ -7880,6 +8389,7 @@ def import_lines(source: str, language: str | None = None) -> set:
     return lines
 
 def hunk_spans(patch: str) -> list[tuple[int, int, int, int]]:
+    """Every hunk of a patch as (old start, old count, new start, new count)."""
     spans = []
     for old, old_count, new, new_count in FENCE_HUNK.findall(patch or ""):
         spans.append((int(old), 1 if old_count == "" else int(old_count),
@@ -7887,12 +8397,22 @@ def hunk_spans(patch: str) -> list[tuple[int, int, int, int]]:
     return spans
 
 def touches(span: tuple[int, int], numbers: set) -> bool:
+    """Does this hunk span cover any of these line numbers?"""
     start, count = span
     return any(number in numbers for number in range(start, start + count))
 
 class Warden:
+    """The part of the run that reads the task's own words and holds the answer to them.
+
+    It finds the file and the method the statement names, runs the project's own check
+    command, reads what changed against what the statement allows, and refuses a hand-in
+    that falls outside it. Every refusal quotes the clause it came from, so the run is held
+    to the task's words rather than to a rule of its own.
+    """
     def __init__(self, tree: Tree, pool: ShellPool, allowance: Allowance,
                  statement: str = "") -> None:
+        """Read the statement: the file it names, the runner it names and the scope it allows.
+        """
         self.tree = tree
         self.tree.statement = statement
         self.pool = pool
@@ -7965,6 +8485,8 @@ class Warden:
             return None
 
     def suite_command(self, root: str | None = None) -> str:
+        """The command that runs the project's own checks, in its own runner or through Python.
+        """
         root = root or self.tree.root
         runner = getattr(self, "runner", "") if RIDGES_SCOPE_FOLLOWS_STATEMENT else ""
         if runner:
@@ -8011,6 +8533,7 @@ class Warden:
         return where, "separate checkout of the base commit"
 
     def pristine(self) -> str | None:
+        """A separate checkout of the base commit, for comparing against the code as it was."""
         owner = tempfile.mkdtemp(prefix="start")
         where = os.path.join(owner, "tree")
         if inside(where, self.tree.root):
@@ -8034,6 +8557,9 @@ class Warden:
         return where
 
     def arm(self) -> None:
+        """Start the project's own check in the background, so its result is ready when it is
+        needed.
+        """
         if not SUBMISSION_WARDEN:
             self.beacon.skipped("not switched on for this run")
             return
@@ -8093,6 +8619,9 @@ class Warden:
             self.beacon.skipped("could not start the baseline reading: %s" % error)
 
     def escalate(self) -> bool:
+        """Move up to a wider way of running the project's tests when the narrower one found
+        nothing.
+        """
         if RIDGES_SCOPE_FOLLOWS_STATEMENT and (self.runner or self.native_runner):
             return False
         if self.where is None:
@@ -8119,6 +8648,11 @@ class Warden:
         return self.job is not None
 
     def stand_in(self, out: str) -> bool:
+        """Write importable stand-ins for modules the project's own tests need and the host lacks.
+
+        Without them a whole test file fails to import, which says nothing about the
+        change; with them the tests that do not need the absent module still run.
+        """
         if self.runner:
             return False
         if not SUITE_SHIM or self.where is None:
@@ -8198,6 +8732,13 @@ class Warden:
         # of its allowance, not for one window: whether it is still running
         # when the answer is ready depends on the host's speed, and the checks
         # a hand-in gets should not.
+        """Wait for the project's own check to finish, so a hand-in is judged against a real
+        result.
+
+        It waits for the check's own allowance rather than one window, because whether
+        it is still running when the answer is ready depends on the host's speed and
+        should not change what the answer is held to.
+        """
         for _ in range((1 + SUITE_SHIM_LIMIT) * len(SUITE_TIERS) + 8):
             self.collect()
             if self.before is not None or self.job is None:
@@ -8213,6 +8754,8 @@ class Warden:
         self.collect()
 
     def collect(self) -> None:
+        """Read the project's check if it has finished, and record what passed and what failed.
+        """
         if self.job is None or self.before is not None:
             if self.before is None:
                 self.report_no_baseline()
@@ -8259,11 +8802,13 @@ class Warden:
 
     @staticmethod
     def tally(out: str) -> str:
+        """The last count line a check printed, or a note that it printed none."""
         found = SUITE_TALLY.findall(out or "")
         return found[-1].strip() if found else "no tally"
 
     @staticmethod
     def reason(out: str) -> str:
+        """The first reason a check gave for failing, and whether there were other kinds."""
         faults = SUITE_FAULT.findall(out or "")
         if faults:
             kinds = len({name for name, _ in faults})
@@ -8274,6 +8819,7 @@ class Warden:
 
     @staticmethod
     def read_suite(out: str, returncode: int | None = None) -> tuple[set, int]:
+        """The failing test names and the passing count from one check's output."""
         failures = set(FAILED_TEST.findall(out or ""))
         outcome, detail = check_outcome(out, exit_code=(... if returncode is None
                                                        else returncode))
@@ -8305,12 +8851,16 @@ class Warden:
         return failures, passing
 
     def report_no_baseline(self) -> None:
+        """Say once that there is no baseline result to compare a hand-in against."""
         if (RIDGES_SCOPE_FOLLOWS_STATEMENT and getattr(self, "before", None) is None
                 and not getattr(self, "no_baseline_reported", False)):
             self.beacon.skipped("no baseline: watched=0")
             self.no_baseline_reported = True
 
     def suite_faults(self) -> list[str]:
+        """Tests that pass on the base commit and fail on the code as it stands, which is a
+        regression.
+        """
         if self.before is None:
             self.report_no_baseline()
             return []
@@ -8524,6 +9074,9 @@ class Warden:
         return code, text
 
     def confirm(self, names: list[str]) -> list[str]:
+        """Re-run named failures on their own, so a failure caused by another test is not blamed on
+        the change.
+        """
         if not names:
             return []
         room = self.allowance.clock_left() - WARDEN_RELEASE_SEC
@@ -8560,6 +9113,7 @@ class Warden:
         return settled
 
     def changed_paths(self) -> list[str]:
+        """Every path that differs from the base commit, including files this run added."""
         code, out = git(["diff", "--name-only", self.tree.base or "HEAD"],
                         self.tree.root, self.read_room(30.0))
         paths = [p for p in out.splitlines() if p.strip()] if code == 0 else []
@@ -8567,6 +9121,9 @@ class Warden:
                               - self.tree.untracked_at_start)
 
     def read_room(self, want: float) -> float:
+        """How long one read may take inside the shared reading window, or an expiry when it is
+        spent.
+        """
         until = getattr(self, "read_until", None)
         if until is None:
             return want
@@ -8576,6 +9133,7 @@ class Warden:
         return min(want, left)
 
     def original(self, path: str) -> str | None:
+        """One file as the base commit has it, or None when it cannot be read."""
         code, out = git(["show", "%s:%s" % (self.tree.base, path)],
                         self.tree.root, self.read_room(30.0))
         return out if code == 0 else None
@@ -8600,6 +9158,9 @@ class Warden:
                 "not a requirement):\n" + redact("\n".join(lines)))
 
     def contract_read(self) -> tuple[list, list]:
+        """Read the changed files for contract breaks, returning the refusals and the advisory
+        notes.
+        """
         self.contract_did_read = False
         self.contract_advisories = []
         if not CONTRACT_LINT:
@@ -8632,6 +9193,7 @@ class Warden:
         return hard[:2], soft[:3]
 
     def contract_one(self, path: str, hard: list, soft: list) -> int:
+        """Read one changed file both ways and collect what the change broke, hard and soft."""
         try:
             before = (self.tree.at_base(path) if getattr(self, "read_until", None) is None
                       else self.tree.at_base(path, self.read_room(15.0)))
@@ -8651,6 +9213,9 @@ class Warden:
         return 1 if contract_readable(path) else 0
 
     def change_faults(self) -> list[str]:
+        """Changes the statement's own words forbid: edited tests, dropped definitions, added
+        suppressions.
+        """
         faults: list[str] = []
         test_clause = next((part.strip() for part in instruction_clauses(self.statement)
                             if re.search(r"\b(?:do not|don't|never|must not)\s+"
@@ -8667,6 +9232,7 @@ class Warden:
         return faults
 
     def file_faults(self, path: str) -> list[str]:
+        """What one changed file breaks against the statement's words, by name and by clause."""
         before = self.original(path)
         if before is None:
             return []
@@ -8696,6 +9262,7 @@ class Warden:
         return out
 
     def change_shapes(self) -> list[tuple[str, str, str, str]]:
+        """Every change by shape: its status, its modes and its path, with renames resolved."""
         rows: list[tuple[str, str, str, str]] = []
         self.shape_sources = {}
         code, out = git(["diff", "--raw", "-z", "-M", self.tree.base or "HEAD"],
@@ -8725,11 +9292,14 @@ class Warden:
         return rows
 
     def fenced_diff(self, path: str) -> str:
+        """One file's diff with no context lines, so the changed lines can be located exactly.
+        """
         code, out = git(["diff", "-U0", self.tree.base or "HEAD", "--", path],
                         self.tree.root, self.read_room(30.0))
         return out if code == 0 else ""
 
     def scope_faults(self, budgeted: bool = True) -> list[str]:
+        """Changes that reach outside the file, the method or the lines the statement allows."""
         self.fence_read = False
         if not EDIT_FENCE:
             self.fence.skipped("not switched on for this run")
@@ -8772,6 +9342,7 @@ class Warden:
         return []
 
     def shape_faults(self, shapes: list, named: str | None) -> list[tuple[str, str]]:
+        """Creations, deletions, renames and mode changes the statement's own words forbid."""
         if not RIDGES_SCOPE_FOLLOWS_STATEMENT:
             return []
         out: list[tuple[str, str]] = []
@@ -8803,6 +9374,8 @@ class Warden:
 
     def line_faults(self, path: str, before: str, after: str,
                     spans: list, wanted: list) -> list[tuple[str, str]]:
+        """Changed lines that fall outside the method or the region the statement confines them to.
+        """
         if not RIDGES_SCOPE_FOLLOWS_STATEMENT:
             return []
         out: list[tuple[str, str]] = []
@@ -8887,6 +9460,8 @@ class Warden:
         return out
 
     def ledger_faults(self) -> list[str]:
+        """The request to read the statement's requirements back, when it lists enough of them.
+        """
         if not LEDGER_READBACK:
             self.ledger.skipped("not switched on for this run")
             return []
@@ -8917,6 +9492,7 @@ class Warden:
         return held
 
     def guarded_reader(self, reader, empty, beacon):
+        """Run one reader and, if it fails, say so in its own slot and carry on with nothing."""
         try:
             return reader()
         except BaseException as error:
@@ -8925,6 +9501,9 @@ class Warden:
             return empty
 
     def final_faults(self, window: float | None = None) -> tuple[int, list[str]]:
+        """The closing readings of the change, inside one shared time window, with how many
+        finished.
+        """
         if RIDGES_SCOPE_FOLLOWS_STATEMENT:
             Warden.report_no_baseline(self)
         done, faults = 0, []
@@ -8952,6 +9531,12 @@ class Warden:
         return done, faults
 
     def verdict(self) -> list[str]:
+        """Whether to hold this hand-in, and the reasons, each quoting the clause it came from.
+
+        The project's check is waited for first. A reader that has already sent the run
+        back enough times stands down, and so does one with too little of the run left
+        to act on a refusal, because a refusal nobody can answer is worse than none.
+        """
         if not SUBMISSION_WARDEN:
             return []
         self.settle()
@@ -8990,6 +9575,7 @@ class Warden:
         return faults
 
 class Finished(Exception):
+    """The answer has been handed in and the run is over."""
     pass
 
 WORK_METER_WORDS = (
@@ -9309,6 +9895,7 @@ WORK_METER_REQUEST = WORK_METER_REQUEST.replace("restore it afterwards%s", "rest
     "sql reports each statement's own work." if DB_TOOL and MEASURE_TOOL else "."), 1)
 
 def work_meter_hits(statement: str, root: str = "") -> list[str]:
+    """The words in the statement that ask for something measurable about database work."""
     if not database_context(statement, root):
         return []
     text = " ".join(instruction_clauses(statement))
@@ -9317,7 +9904,14 @@ def work_meter_hits(statement: str, root: str = "") -> list[str]:
                          text, re.I)]
 
 class WorkMeter:
+    """What the run observed about database work, and what it may therefore claim.
+
+    An observation of what the database did is recorded as an observation. It is never
+    turned into a claim that the change improved anything, because this run does not compare
+    before with after unless it measured both.
+    """
     def __init__(self):
+        """Open the meter armed, with nothing observed yet."""
         self.beacon = Beacon("meter")
         self.state = "armed"
         self.command = ""
@@ -9326,6 +9920,8 @@ class WorkMeter:
         self.calls = self.spent = 0
 
     def extend(self, kit, note):
+        """Add what the meter observed to a hand-in note, once, when the statement asked for it.
+        """
         if self.state != "armed":
             return note
         self.state = "done"
@@ -9369,12 +9965,14 @@ class WorkMeter:
             return note
 
     def skip_error(self, error):
+        """Record that a reading ended on an error rather than a result."""
         try:
             self.beacon.skipped("reading ended on %s" % type(error).__name__)
         except BaseException:
             pass
 
     def record(self, command, out="", returncode=None):
+        """Keep the output of a command that actually showed what the database did."""
         try:
             if returncode != 0:
                 return
@@ -9386,6 +9984,7 @@ class WorkMeter:
             self.skip_error(error)
 
     def close(self, kit):
+        """Say what was observed and that an improvement was not certified, then stand down."""
         if self.state != "asked":
             return
         self.state = "done"
@@ -9812,6 +10411,7 @@ def measurement_text(value: str) -> str:
     return value.encode("utf-8", "backslashreplace").decode("utf-8")
 
 def capture_measurement(out: str, record: dict) -> dict | None:
+    """Keep one measurement's structured report, under the lock that bounds their total size."""
     with MEASUREMENT_LOCK:
         return _capture_measurement(out, record)
 
@@ -9930,6 +10530,7 @@ def _capture_measurement(out: str, record: dict) -> dict | None:
     return data
 
 def measurement_note(record: dict) -> str:
+    """A sentence on what a measurement captured, and on what it leaves unresolved."""
     if record.get("measurement_capture_error"):
         return ("Structured measurement capture failed (%s); retained reports=0; "
                 "omitted and unknown report counts are unknown. Execution provenance "
@@ -9965,9 +10566,18 @@ def execution_failure(code, out: str, timed_out: bool = False, *, checker: bool 
 
 
 class Kit:
+    """The tools the model may call, and the bookkeeping that keeps their results honest.
+
+    Every tool goes through here: reading and editing files, running commands and database
+    statements, measuring work, pinning expectations, and handing in. Each call is recorded
+    against the identity of the source it ran on, so evidence from before an edit is never
+    read as evidence for the code as it stands.
+    """
     def __init__(self, tree: Tree, pool: ShellPool, allowance: Allowance,
                  warden: Warden | None = None, label: str = "",
                  findings: "FindingMap | None" = None) -> None:
+        """Set up the tool kit over one checkout, with its allowance, its warden and its beacons.
+        """
         self.tree = tree
         self.pool = pool
         self.allowance = allowance
@@ -10182,6 +10792,8 @@ class Kit:
             pass
 
     def note_findings(self, command: str, out: str) -> None:
+        """Pass one command's output to the finding record, and never let that reading end the run.
+        """
         if self.findings is None:
             return
         try:
@@ -10190,11 +10802,13 @@ class Kit:
             self.findings.beacon.skipped("the output could not be read")
 
     def note_read(self, what: str) -> None:
+        """Log one read, so the run shows what was looked at as well as what was changed."""
         say("[READ]%s %s" % (" " + self.label if self.label else "", what))
 
     def run(self, name: str, args: dict) -> str:
         # A completed command can supply its undecorated observation below.
         # Never reuse it for a subsequent tool call, including a rejected one.
+        """Dispatch one tool call by name, after bringing the workspace up to date."""
         self.progress_observation = None
         if self.pool.jobs:
             self.sync_workspace()
@@ -10223,6 +10837,12 @@ class Kit:
         return digest.hexdigest()
 
     def sync_workspace(self, count_edits=True) -> None:
+        """Notice that the files changed under this run, count it as an edit and forget stale
+        reads.
+
+        A command can change the tree as surely as the editor can, so the identity of
+        the workspace is read rather than assumed from which tool was called.
+        """
         stamp = self._workspace_stamp()
         if stamp is not None and stamp != self.workspace_stamp:
             if self.workspace_stamp is not None and count_edits:
@@ -10231,6 +10851,7 @@ class Kit:
             self.workspace_stamp = stamp
 
     def guard_repeat(self, key: str) -> None:
+        """Refuse a call that was already answered and whose answer cannot have changed."""
         self.seen[key] = self.seen.get(key, 0) + 1
         if self.seen[key] > REPEAT_READ_CEILING:
             raise ToolFault(
@@ -10255,6 +10876,7 @@ class Kit:
             return ""
 
     def do_read_requirement(self, args: dict) -> str:
+        """One of the statement's requirements by its number, or a range of them."""
         identifier = args.get("id")
         offset = args.get("offset", 0)
         if not isinstance(identifier, str) or not re.fullmatch(
@@ -10316,6 +10938,7 @@ class Kit:
                 + value[offset:end] + continuation)
 
     def do_read_file(self, args: dict) -> str:
+        """Part of a file, by line or by character offset, with its own line numbers."""
         path = str(args.get("path") or "")
         start = args.get("start")
         count = args.get("count")
@@ -10393,6 +11016,9 @@ class Kit:
         return served
 
     def do_outline(self, args: dict) -> str:
+        """A file's classes and functions as an outline, for finding the right place without
+        reading it all.
+        """
         path = str(args.get("path") or "")
         self.guard_repeat("outline:%s" % path)
         text = self.tree.read(path)
@@ -10411,6 +11037,7 @@ class Kit:
         return served
 
     def do_search_text(self, args: dict) -> str:
+        """Search the checkout for a pattern, in file contents or in file names."""
         pattern = str(args.get("pattern") or "")
         where = str(args.get("path") or ".")
         mode = str(args.get("mode") or "content")
@@ -10467,6 +11094,7 @@ class Kit:
         return served
 
     def do_find_files(self, args: dict) -> str:
+        """The files whose paths match a glob, a page at a time."""
         import fnmatch
         pattern = str(args.get("pattern") or "*")
         offset = args.get("offset", 0)
@@ -10504,6 +11132,12 @@ class Kit:
         return "\n".join(rows)
 
     def do_edit(self, args: dict) -> str:
+        """Replace one exact piece of text in a file, then report what the edit means.
+
+        The old text must match exactly, so an edit can never land in a place the model
+        did not read. Afterwards the file is compiled, its queries and its shape are
+        read, and anything worth knowing is said back.
+        """
         path = str(args.get("path") or "")
         old = str(args.get("old") or "")
         new = str(args.get("new") or "")
@@ -10552,6 +11186,9 @@ class Kit:
         return "edited %s (%d occurrence%s)%s" % (path, hits if every else 1, "" if hits == 1 else "s", note)
 
     def do_create_file(self, args: dict) -> str:
+        """Write a whole file, comparing against the bytes on disk so an unchanged write is
+        reported as one.
+        """
         path = str(args.get("path") or "")
         content = str(args.get("content") or "")
         # Compared against the bytes on disk, not against a tidied reading of
@@ -10572,6 +11209,9 @@ class Kit:
                                      self.fence_note(path, content))
 
     def compile_check(self, path: str) -> str:
+        """Check that an edited file still parses, in its own language, and say so when it does
+        not.
+        """
         argv = SYNTAX_CHECKS.get(os.path.splitext(path)[1].lower())
         if execution_prohibited(statement_of(getattr(self, "warden", None))):
             if not path.endswith(".py"):
@@ -10778,6 +11418,7 @@ class Kit:
                 "unresolved:\n" + case_block(record, identity))
 
     def do_read_case(self, args: dict) -> str:
+        """One declared case as it stands, by name, a page at a time."""
         name, offset = args.get("case_id"), args.get("offset", 0)
         if not isinstance(name, str) or (name and not CASE_ID.fullmatch(name)):
             raise ToolFault("case_id must be an existing name, or empty for the unnamed case")
@@ -10812,6 +11453,7 @@ class Kit:
                 + text[offset:end] + continuation)
 
     def do_read_measurement(self, args: dict) -> str:
+        """One measurement's structured report by its identifier, a page at a time."""
         check_id, offset = args.get("check_id"), args.get("offset", 0)
         if not isinstance(check_id, str) or not re.fullmatch(r"check-[1-9][0-9]*", check_id):
             raise ToolFault("check_id must be an existing measurement check-N identifier")
@@ -10839,6 +11481,9 @@ class Kit:
                 + text[offset:end] + continuation)
 
     def requirement_coverage(self) -> dict:
+        """For each stated requirement: what was declared about it, what was observed, what is
+        unresolved.
+        """
         rows = requirement_catalog(statement_of(getattr(self, "warden", None)),
                                    getattr(getattr(self, "tree", None), "root", ""))
         current = self.source_identity()
@@ -11164,6 +11809,8 @@ class Kit:
                      clip(scrub(result, target), SQL_OUTPUT_CAP, "query output")), target)
 
     def measure_dir(self) -> str:
+        """A private directory for measurement work, made once and removed when the pool closes.
+        """
         where = getattr(self, "_measure_dir", None)
         if not where or not os.path.isdir(where):
             where = tempfile.mkdtemp(prefix="measure")
@@ -11173,6 +11820,9 @@ class Kit:
 
     @staticmethod
     def window_query_id() -> str:
+        """A query id for one measurement window: unique here, and the same on every run of this
+        problem.
+        """
         global MEASURE_WINDOW_COUNTER
         MEASURE_WINDOW_COUNTER += 1
         # One process, one database: a counter is unique here, and the same on
@@ -11206,6 +11856,7 @@ class Kit:
         return stats if isinstance(stats, dict) else None
 
     def window_begin(self, target) -> dict:
+        """Open a measurement window on the configured database, and say whether it opened."""
         if target is None:
             return {"kind": "none", "ok": False, "note": "no configured database to read work from"}
         if target.engine == "clickhouse" and target.scheme != "native" and CH_HTTP:
@@ -11567,6 +12218,13 @@ class Kit:
         return "\n".join(lines)
 
     def do_bash(self, args: dict) -> str:
+        """Run one shell command in the checkout, under this run's rules.
+
+        A command that would reach the network, rewrite history or change the live
+        database is refused with the reason. Everything else runs in the background with
+        its own timeout and lane, so a long command can be collected later rather than
+        blocking the run.
+        """
         self.sync_workspace()
         command = str(args.get("command") or "")
         if not command.strip():
@@ -11670,6 +12328,8 @@ class Kit:
 
     @staticmethod
     def database_write_text(verb: str, engine: str) -> str:
+        """The refusal for a command that would change the live database, and what to do instead.
+        """
         return ("Not run: this sends %s to the live database, where the change stays after the "
                 "command ends. The answer is the patch, and a change made in the database is not "
                 "part of it; the baseline checkout, measure and the project's tests also read this "
@@ -11741,6 +12401,7 @@ class Kit:
         return "%s to %s (configured database endpoint)" % (tools, ", ".join(dict.fromkeys(reached)))
 
     def do_bash_poll(self, args: dict) -> str:
+        """Collect a background command, waiting for it when the run still has time."""
         job = self.pool.get(str(args.get("job") or ""))
         waiter = getattr(job, "wait", None)
         if callable(waiter) and not job.finished():
@@ -11762,6 +12423,7 @@ class Kit:
         return "[running; collect again with bash_poll]\n" + (clip(out, SHELL_OUTPUT_CAP, "partial output") or "(no output)")
 
     def finish_shell(self, job: Shell, out: str) -> str:
+        """Close out a finished command: record it, read its output and say what it means."""
         self.pool.jobs.pop(job.name, None)
         try:
             self.sync_workspace()
@@ -11809,6 +12471,12 @@ class Kit:
             job.stop()
 
     def do_submit(self, args: dict) -> str:
+        """Hand in the answer, unless something holds it back.
+
+        An answer that would be an empty patch is refused outright. Otherwise the holds
+        are asked in turn, and the run goes on; when nothing holds it, this is the end
+        of the run.
+        """
         refused = empty_answer_note(self)
         if refused:
             say("[HANDIN] submit refused: the answer would be an empty patch")
@@ -11965,6 +12633,12 @@ class Kit:
         return EXPECT_REQUIRED_TEXT
 
     def handin_pause(self) -> str | None:
+        """The one thing standing between this answer and the hand-in, or None when nothing does.
+
+        A tree the run already knows is wrong is not sent to the second reader, because
+        the hold goes back on its own and the reader's budget is better spent on an
+        answer that might be right.
+        """
         self.work_meter.close(self)
         held = self.expectation_note() or self.green_note() or self.expectation_required_note()
         if held:
@@ -12116,6 +12790,7 @@ class Kit:
         return GREEN_LOST % (self.green["edits"], redact(self.green["command"])[:120])
 
     def do_restore_green(self, args: dict) -> str:
+        """Put the files back to the last state that passed the task's named check."""
         why = " ".join(str(args.get("why") or "").split())[:200]
         if not self.green:
             raise ToolFault("no passing state has been kept in this run")
@@ -12155,12 +12830,15 @@ class Kit:
                 pass
 
     def count_restore(self) -> None:
+        """Count a restore as an edit, so what follows is judged against the tree as it now stands.
+        """
         self.allowance.edits += 1
         self.source_edits += 1
         self.seen.clear()
         self.sync_workspace(count_edits=False)
 
     def _handin_pause(self) -> str | None:
+        """The next hold in the hand-in ladder, with each state asked only once."""
         if not HIDDEN_SELFREVIEW:
             return self.selfreview_note() or self.conform_note()
         for state, name in HANDIN_PAUSES:
@@ -12176,6 +12854,7 @@ class Kit:
         return None
 
     def selfreview_close(self, why: str) -> list[str]:
+        """Close the second reading when the run ends, whatever ended it."""
         try:
             self.work_meter.close(self)
             return self._selfreview_close(why)
@@ -12188,6 +12867,9 @@ class Kit:
             return []
 
     def _selfreview_close(self, why: str) -> list[str]:
+        """Record what the second reading bought, and whether it stayed inside the change's own
+        region.
+        """
         if self.selfreview_closed or not self.selfreview_asked:
             if self.selfreview_state == "armed":
                 self.selfreview_state = "done"
@@ -12214,6 +12896,7 @@ class Kit:
         return faults
 
     def consult_record(self, command: str, out: str, returncode: int | None = None) -> None:
+        """Keep one command's result for the readers that will be asked about it later."""
         self.work_meter.record(command, out, returncode)
         if self.consult_state != "armed" and self.review_state != "armed":
             return
@@ -12228,6 +12911,8 @@ class Kit:
         del self.consult_log[:-CONSULT_HISTORY_LINES]
 
     def consult_ask(self, statement: str, diff: str) -> str:
+        """Ask a fresh seat, with no transcript, what it makes of the statement and the change.
+        """
         seat = Seat(self.allowance, models=[CONSULT_MODEL], patient=False,
                     impatient_sec=CONSULT_CALL_SEC,
                     effort=CONSULT_EFFORT, reply_ceiling=CONSULT_MAX_TOKENS)
@@ -12242,6 +12927,8 @@ class Kit:
         return str(reply.get("content") or "").strip()
 
     def consult_splice(self, note: str, diff: str) -> str:
+        """Add a fresh reading of the change to a hand-in note, once, when the run can afford it.
+        """
         if self.consult_state != "armed":
             return note
         self.consult_state = "done"
@@ -12694,6 +13381,9 @@ class Kit:
             return None
 
     def selfreview_note(self) -> str | None:
+        """Ask the run to read its own change once before handing it in, and record what came of
+        it.
+        """
         if self.selfreview_state == "asked":
             self.selfreview_state = "done"
             self.selfreview_closed = True
@@ -12739,6 +13429,8 @@ class Kit:
         ), diff)
 
     def unbound_reading(self) -> str:
+        """A note on anything still unaccounted for at hand-in, or empty when the reading failed.
+        """
         try:
             return unbound_at_hand_in(self.tree)
         except BaseException:
@@ -12830,6 +13522,7 @@ class Kit:
                 "what this ClickHouse server does not have: %s" % clickhouse_names_text(found)) if found else ""
 
     def selfreview_outcome(self) -> None:
+        """Record what the second reading changed, or why the pair cannot be compared."""
         if self.selfreview_reported:
             return
         self.selfreview_reported = True
@@ -12846,6 +13539,8 @@ class Kit:
         self.selfreview.outcome(self.selfreview_before, after)
 
     def selfreview_share(self) -> float | None:
+        """How far through its allowance the run is, as a share, or None when that cannot be told.
+        """
         try:
             budget = self.allowance.deadline - self.allowance.started
             if not finite_number(budget) or budget <= 0:
@@ -12855,6 +13550,9 @@ class Kit:
             return None
 
     def conform_note(self) -> str | None:
+        """Ask once, before the answer goes, that every stated detail be pointed at the code that
+        satisfies it.
+        """
         if self.conform_state == "asked":
             self.conform_state = "done"
             self.conform.fired("resubmitted after %d further edit(s)"
@@ -12890,6 +13588,8 @@ COMMON_WORDS = frozenset(
 )
 
 def quoted_parts(name: str, called: bool = False) -> list[str]:
+    """The searchable parts of a backticked name: the whole of it, and its segments worth matching.
+    """
     parts = name.split(".")
     if len(parts) == 1:
         return parts
@@ -12897,10 +13597,19 @@ def quoted_parts(name: str, called: bool = False) -> list[str]:
     return segments if called else [name] + segments
 
 def sweep_order(terms: set, quoted: set) -> list[str]:
+    """Search terms in the order worth trying: the statement's own backticked names first, longest
+    first.
+    """
     return sorted(terms, key=lambda t: (t not in quoted, -len(t), t))
 
 def candidate_files(tree: Tree, statement: str, beacon: Beacon,
                     limit: int = 12) -> list[str]:
+    """The files most likely to matter, found by searching the checkout for the statement's own
+    words.
+
+    This costs no model call, so the opening message can name the places worth reading
+    before the first reply.
+    """
     quoted = {p for name, call in QUOTED_RE.findall(statement)
               for p in quoted_parts(name.lower(), bool(call))}
     terms = {w.lower() for w in WORD_RE.findall(statement)} - COMMON_WORDS
@@ -12941,6 +13650,8 @@ def candidate_files(tree: Tree, statement: str, beacon: Beacon,
     return ranked
 
 def repo_sketch(tree: Tree) -> str:
+    """A few lines describing the checkout: its size, its top directories and the languages in it.
+    """
     parts = []
     code, listing = git(["ls-files"], tree.root, 30)
     files = listing.splitlines() if code == 0 else []
@@ -13019,7 +13730,9 @@ whether it changes anything the problem did not ask for. Go through the statemen
 requirements one by one and point each at a hunk that meets it, or at a line you kept
 because it already did. On a task that lists what the rows must be, the hand-in waits
 until at least one expectation has been checked on the application's data with the
-code as it stands. Call
+code as it stands. Leave the file's imports as they were unless the problem is about
+them, and run the repository's own lint command when it names one. When you move code,
+move it as it is; rewording along the way is a second change nobody asked for. Call
 submit with a one-line summary of what you changed."""
 
 DB_WORKFLOW_EDGES = """Before editing a query, settle which engine and which query layer
@@ -13036,6 +13749,9 @@ that sentence requires.
 """
 
 def without_sweep(brief: str) -> str:
+    """The brief with the repeated-defect section removed, for a run with that behaviour switched
+    off.
+    """
     start = brief.find("WHEN THE SAME DEFECT")
     end = brief.find("BEFORE YOU SUBMIT")
     return brief[:start] + brief[end:] if 0 <= start < end else brief
@@ -13089,6 +13805,9 @@ def database_workflow(forbidden: str = "") -> str:
     return DB_WORKFLOW_COMMON + ("\n" + DB_WORKFLOW_EDGES if DB_TOOL else "")
 
 def compose_brief(statement: str, root: str) -> str:
+    """The brief this run gives the model: the standing one, plus the database guidance when it
+    applies.
+    """
     text = BRIEF if SWEEP_WORKFLOW else without_sweep(BRIEF)
     if database_context(statement, root):
         text += database_workflow(execution_prohibited(statement))
@@ -13220,6 +13939,8 @@ KIND_NEGATION_AFTER = re.compile(
     r"^\w*\s+(?:is|are)\s+(?:not\s+)?(?:a\s+)?non[- ]?goal\b", re.I)
 
 def negated_kind(text: str, found) -> bool:
+    """Is this match of a work kind negated by the words around it, such as a sentence refusing it?
+    """
     if not NEGATABLE_KIND.search(found.group(0)):
         return False
     before = re.split(r"[.;!?]", text[max(0, found.start() - 40):found.start()])[-1]
@@ -13253,11 +13974,16 @@ REQUIREMENT_BREAK = re.compile(r"[;,]\s|\sand\s|\sor\s")
 REQUIREMENT_CHARS = 170
 
 def asks_to_keep(item: str) -> bool:
+    """Does this requirement ask that something stay as it is, rather than asking for a change?
+    """
     return bool(REQUIREMENT_GUARD.search(item or ""))
 REQUIREMENT_MAX = 12
 READ_REQUIREMENT_ITEMS = 20
 
 def requirement_excerpt(item: str) -> str:
+    """A requirement clipped to its cap at a sentence or clause break, with a marker where it was
+    cut.
+    """
     if len(item) <= REQUIREMENT_CHARS:
         return item
     marker = " [...]"
@@ -13439,6 +14165,7 @@ def requirement_order(items: list) -> list:
     return sorted(items, key=rank)
 
 def compact_ids(ids: list) -> str:
+    """Requirement numbers written compactly, with runs of consecutive ones given as ranges."""
     numbers = sorted({int(i[1:]) for i in ids if re.fullmatch(r"R\d+", i)})
     out: list = []
     start = previous = None
@@ -13757,6 +14484,8 @@ def bind(bindings: dict, name: str, value: str, source: str, rank: int) -> None:
         bindings[name] = {"value": value, "source": source, "rank": rank}
 
 def env_file_bindings(root: str, bindings: dict, deadline: float) -> None:
+    """Database settings read from the project's own environment files, within the time allowed.
+    """
     for name in ENV_FILE_NAMES:
         if time.time() >= deadline:
             return
@@ -14153,6 +14882,7 @@ def single_statement(query: str) -> str:
             "at character %d. Send the part you need to measure." % (index + 1))
 
 def sql_has_format(query: str) -> bool:
+    """Does this statement already name its own output format, so one must not be added?"""
     return bool(re.search(r"\bFORMAT\s+[A-Za-z]+\s*;?\s*$", sql_code_only(query or ""), re.I))
 
 class ClickHouseHttp:
@@ -14165,11 +14895,18 @@ class ClickHouseHttp:
     """
 
     def __init__(self, target: "DatabaseTarget") -> None:
+        """Bind an HTTP client to one configured database."""
         self.target = target
 
     def request(self, sql: str, *, budget: float, query_id: str = "", readonly=2,
                 params: dict | None = None, settings: dict | None = None,
                 database: bool = True) -> dict:
+        """Send one statement over HTTP and return what came back, with the status and timings.
+
+        Every request carries a query id, a read-only setting and its own budget, so it
+        can be found afterwards in the server's own records and cannot outlive the time
+        it was given.
+        """
         import socket
         query = {}
         if database and self.target.database:
@@ -14306,6 +15043,9 @@ class ClickHouseHttp:
 
     @staticmethod
     def describe(result: dict, with_text: bool = True) -> str:
+        """What happened to one request, in a sentence: the server's code and its first line, or
+        the transport fault.
+        """
         if result.get("status") is None:
             return "no HTTP response (%s)%s" % (result.get("transport_error") or "transport error",
                                                  "; timed out" if result.get("timed_out") else "")
@@ -14356,6 +15096,8 @@ def link_dependency_dirs(root: str, where: str, budget: float = 10.0) -> list:
     return shared
 
 def thousands(value) -> str:
+    """A number for reading: grouped digits, three decimals for a fraction, and n/a for nothing.
+    """
     if isinstance(value, bool) or value is None:
         return "n/a"
     if isinstance(value, int):
@@ -14365,6 +15107,7 @@ def thousands(value) -> str:
     return str(value)
 
 def ratio_text(before, after) -> str:
+    """The ratio of after to before, or the reason that ratio says nothing."""
     if not isinstance(before, (int, float)) or not isinstance(after, (int, float)) or isinstance(before, bool):
         return ""
     if before == 0:
@@ -14381,6 +15124,7 @@ class HttpProbe:
     counter = 0
 
     def __init__(self, command: str, cwd: str, target: "DatabaseTarget", settings: dict) -> None:
+        """Open a probe for one statement against one configured database."""
         HttpProbe.counter += 1
         self.name = "http%d" % HttpProbe.counter
         self.command = command
@@ -14399,30 +15143,38 @@ class HttpProbe:
         self.process = self
 
     def poll(self):
+        """The probe's exit code, or None while it has not finished."""
         return self._code
 
     def complete(self, text: str, code: int, timed_out: bool = False) -> None:
+        """Record the probe's output, its code and whether it ran out of time."""
         self._out, self._code, self.timed_out = text, code, timed_out
 
     def _text(self) -> str:
+        """Everything the probe returned."""
         return self._out
 
     def _tail(self, cap: int = SHELL_OUTPUT_CAP) -> str:
+        """The last of what the probe returned."""
         return self._out[-cap:]
 
     def finished(self) -> bool:
+        """Has the probe finished?"""
         return self._code is not None
 
     def wait(self, timeout: float) -> tuple:
+        """Whether the probe has finished, with what it returned; it does not block."""
         return self.finished(), self._out
 
     def result(self, out: str) -> str:
+        """The probe's status line and its output, clipped, as the model will read it."""
         status = "running" if self._code is None else "exit_code=%d" % self._code
         if self.timed_out:
             status += " timed_out=true"
         return "[%s]\n%s" % (status, clip(steady(out), SHELL_OUTPUT_CAP, "query output") or "(no output)")
 
     def stop(self) -> None:
+        """Close the probe."""
         self.closed = True
 SQL_CHARS_MAX = 200_000
 PG_CONNECT_TIMEOUT = "5"
@@ -14680,6 +15432,9 @@ def plan_shape_notes(sql_text: str = "", plan=None, plan_text: str = "") -> list
     return unique[:PLAN_NOTE_CAP]
 
 def plan_notes_block(notes: list) -> str:
+    """The execution-plan counters that were observed, said as observations rather than as a
+    verdict.
+    """
     if not notes:
         return ""
     return ("\nObserved execution-plan counters (not a correctness or improvement verdict):\n"
@@ -14763,6 +15518,7 @@ class ClickHouseCatalog:
     """What one ClickHouse server lists as functions, and the words that precede "(" without calling."""
 
     def __init__(self, tables: dict) -> None:
+        """Read one server's catalog into the sets a name can be checked against."""
         rows = tables.get("functions") or []
         self.functions = {row["name"] for row in rows}
         self.any_case = {row["name"].lower() for row in rows if row.get("case_insensitive")}
@@ -14775,6 +15531,7 @@ class ClickHouseCatalog:
         self.not_calls = words
 
     def trusted(self) -> bool:
+        """Did enough of the catalog come back to be worth consulting?"""
         return len(self.functions) >= CH_NAME_FLOOR
 
     def lists(self, name: str) -> bool:
@@ -14868,6 +15625,9 @@ class DatabaseTarget:
     def __init__(self, engine: str, host: str, port: int, database: str,
                  user: str = "", password: str = "", source: str = "",
                  scheme: str = "") -> None:
+        """Record one configured database, with its engine normalised and its password kept out of
+        sight.
+        """
         self.engine = normalize_engine(engine)
         self.host = host
         self.port = port
@@ -14923,6 +15683,7 @@ class DatabaseTarget:
             self.observations["authenticated"] = True
 
     def begin_attempt(self) -> None:
+        """Start a fresh attempt: nothing is known about this target until it answers."""
         self.state, self.detail = "unknown", "client running; execution is unconfirmed"
         for name in ("reachable", "authenticated", "executed", "rollback"):
             self.observations[name] = None
@@ -14968,12 +15729,15 @@ class DatabaseTarget:
                                   self.database or "?")
 
     def describe(self) -> str:
+        """The target as the model reads it: where it is, who connects, and what has been observed.
+        """
         who = (" as %s" % self.user) if self.user else ""
         facts = ", ".join("%s=%s" % (name, "unknown" if value is None else str(value).lower())
                           for name, value in self.observations.items())
         return "%s%s [%s: %s; %s]" % (self.label, who, self.state, self.detail, facts)
 
     def secret(self) -> str:
+        """The password for this target, for the one place that has to pass it to a client."""
         return self._password
 
     def argv(self, sql_path: str = "") -> list:
@@ -15375,6 +16139,9 @@ def opening_file(statement: str, tree: Tree) -> str:
 
 def opening_message(statement: str, tree: Tree, hints: list[str],
                     facts: list | None = None, file_block: str = "") -> str:
+    """The first message the model sees: the task, the repository, the requirements and the facts
+    read for free.
+    """
     blocks = ["Problem to fix:\n\n" + statement.strip(), "\nRepository at a glance:\n" + repo_sketch(tree)]
     requirements = requirement_block(statement, getattr(tree, "root", ""))
     if requirements:
@@ -15590,11 +16357,13 @@ PLAN_EXTRA_TOOLS = [
 ]
 
 def plan_tools() -> list[dict]:
+    """The read-only tools the planning seat is offered."""
     return [s for s in TOOL_SCHEMAS
             if s["function"]["name"] in PLAN_TOOL_NAMES] + PLAN_EXTRA_TOOLS
 
 def run_plan(statement: str, tree: Tree, pool: ShellPool, allowance: Allowance,
              beacon: Beacon, turn: int) -> str:
+    """Ask a fresh seat for a short plan of attack before the work starts, and return it."""
     beacon.reached(turn, allowance.spent, allowance.clock_left())
     if not PLAN_SEAT:
         beacon.skipped("not switched on for this run")
@@ -15695,6 +16464,14 @@ def call_order(calls: list) -> tuple[list, set]:
 
 def drive(statement: str, tree: Tree, pool: ShellPool, allowance: Allowance,
           findings: "FindingMap | None" = None, seed_salt: int = 0) -> None:
+    """Work the problem: the loop that reads, edits, checks and hands in.
+
+    One seat drives with the tools; the warden holds the answer to the statement; the
+    beacons record every decision. The loop ends when the answer is handed in, when the
+    turns run out, or when the allowance does, and the second reading is closed out whatever
+    ended it. A seed salt lets a later derivation of the same problem start from a different
+    sampling state.
+    """
     seat = Seat(allowance)
     seat.seed = (request_seed(statement) + seed_salt) % (2 ** 31)
     warden = Warden(tree, pool, allowance, statement)
@@ -16032,12 +16809,24 @@ def second_derivation(statement: str, tree: Tree, pool: ShellPool, allowance: Al
     """Work the problem again from a clean tree, then leave the better answer in the tree."""
     beacon = Beacon("second")
     beacon.reached(allowance.calls, allowance.spent, allowance.clock_left())
-    if not SECOND_DERIVATION:
-        beacon.skipped("not switched on for this run")
-        return
     first = capture_derivation(tree, allowance, "first")
     if first is None:
-        beacon.skipped("no first answer to compare with")
+        if allowance.clock_left() < SECOND_MIN_SEC or allowance.money_left() < SECOND_MIN_USD:
+            beacon.skipped("no first answer, and too little of the run left to try again")
+            return
+        beacon.fired("no first answer after $%.3f and %d calls; working the problem again from a clean tree"
+                     % (allowance.spent, allowance.calls))
+        try:
+            if clean_tree(tree, 60.0):
+                reset_checks()
+                drive(statement, tree, pool, allowance, None, seed_salt=1)
+        except Spent as stop:
+            say("[SECOND] out of allowance: %s" % stop)
+        except BaseException as error:
+            say("[SECOND] ended on %s: %s" % (type(error).__name__, str(error)[:120]))
+        return
+    if not SECOND_DERIVATION:
+        beacon.skipped("not switched on for this run")
         return
     if allowance.clock_left() < SECOND_MIN_SEC:
         beacon.skipped("too little of the run left: %.0fs" % allowance.clock_left())
@@ -16146,6 +16935,8 @@ STATEMENT_ECHO_LINES = 200
 STATEMENT_ECHO_WIDTH = 400
 
 def echo_statement(statement: str) -> None:
+    """Write the task statement into the run log, so a run can be read without the task to hand.
+    """
     lines = statement.splitlines()
     say("[TASK] %d line(s), %d char(s)" % (len(lines), len(statement)))
     for line in lines[:STATEMENT_ECHO_LINES]:
@@ -16154,6 +16945,14 @@ def echo_statement(statement: str) -> None:
         say("[TASK] | ... %d more line(s)" % (len(lines) - STATEMENT_ECHO_LINES))
 
 def agent_main(input: dict) -> str:
+    """Solve the problem in the checkout and return the answer as a patch.
+
+    The entry point: it sets up the allowance, the checkout and the shell pool, drives the
+    work, then builds the answer the way it will be read. The tree is put back to the base
+    commit before the patch is finished, by-products and anything outside the task's
+    boundary are dropped, and a patch that does not apply is salvaged section by section.
+    Whatever goes wrong, a string comes back rather than an exception.
+    """
     pool = None
     tree = None
     try:
@@ -16165,7 +16964,7 @@ def agent_main(input: dict) -> str:
         pool = ShellPool(root)
         statement = str((input or {}).get("problem_statement") or "").strip()
         findings = FindingMap(root) if FINDING_MAP else None
-        say("[RUN] budget=$%.3f clock=%.0fs build=v55 driver=%s relief=%s last=%s review=%s plan=%s "
+        say("[RUN] budget=$%.3f clock=%.0fs build=v58 driver=%s relief=%s last=%s review=%s plan=%s "
             "seed=%s effort=%s flags=review:%d closer:%d expect:%d green:%d parallel:%d plan:%d "
             "second:%d third:%d required:%d"
             % (allowance.ceiling_usd, allowance.clock_left(), DRIVER_MODEL, RELIEF_MODEL, LAST_RESORT_MODEL,
@@ -16235,7 +17034,7 @@ def agent_main(input: dict) -> str:
             say("[%s] skipped: %s" % (Beacon.tag("byproduct"), type(error).__name__))
     if PATCH_ENVELOPE and patch.strip():
         try:
-            patch = envelope_trim(patch, Beacon("envelope"), statement, root)
+            patch = envelope_or_whole(patch, Beacon("envelope"), statement, root)
         except BaseException as error:
             say("[%s] skipped: the envelope could not be read: %s"
                 % (Beacon.tag("envelope"), type(error).__name__))
